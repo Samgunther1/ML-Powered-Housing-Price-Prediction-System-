@@ -112,6 +112,40 @@ This installs all the Python packages the project uses.
 
 ## Basic Git Workflow
 
+You can use either the **command line** or **GitHub Desktop** — both do the same thing. GitHub Desktop is recommended if you're new to Git.
+
+### Option A: GitHub Desktop (Recommended)
+
+#### Install GitHub Desktop
+
+1. Go to [https://desktop.github.com](https://desktop.github.com)
+2. Download and install it for your OS
+3. Open GitHub Desktop and sign in with your GitHub account
+
+#### Clone the Repository in GitHub Desktop
+
+1. Click **File → Clone Repository**
+2. Select the **URL** tab
+3. Paste the repository URL: `https://github.com/YOUR-USERNAME/ML-Powered-Housing-Price-Prediction-System.git`
+4. Choose a local folder where you want the project saved
+5. Click **Clone**
+
+#### Daily Workflow in GitHub Desktop
+
+Every time you sit down to work:
+
+1. **Pull latest changes**: Click the **"Fetch origin"** button at the top, then **"Pull origin"** if there are new changes
+2. **Do your work** in VS Code (GitHub Desktop will automatically detect your changes)
+3. **Review your changes**: In GitHub Desktop, you'll see a list of changed files on the left. Review them to make sure everything looks right
+4. **Commit**: At the bottom-left, type a short summary describing what you did (e.g., "Added feature engineering for sqft and lot size"), then click **"Commit to main"**
+5. **Push**: Click the **"Push origin"** button at the top to upload your changes to GitHub
+
+#### Opening in VS Code from GitHub Desktop
+
+After cloning, click **Repository → Open in Visual Studio Code** to jump straight into the project. You can also use this shortcut any time to open the project.
+
+### Option B: Command Line
+
 Every time you sit down to work on the project, follow this pattern:
 
 ```bash
@@ -132,7 +166,7 @@ git push origin main
 
 ### Tips to Avoid Merge Conflicts
 
-- **Always pull before you start working**
+- **Always pull/fetch before you start working** (this applies to both GitHub Desktop and command line)
 - Communicate with the team about which files you are editing
 - Commit and push frequently — small commits are better than large ones
 
