@@ -21,7 +21,7 @@ Before you begin, you need to install two things: **Visual Studio Code** and **P
 ### 2. Install Python
 
 1. Go to [https://www.python.org/downloads](https://www.python.org/downloads)
-2. Download the latest version of Python 3 (3.11 or 3.12 recommended)
+2. Download the latest version of Python 3 (3.12 recommended)
 3. Run the installer
    - **⚠️ IMPORTANT (Windows):** Check the box that says **"Add Python to PATH"** at the bottom of the first installer screen — do not skip this step
 4. Verify the installation by opening a terminal and running:
