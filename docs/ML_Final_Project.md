@@ -125,12 +125,12 @@ A data log will be utilized to keep track of all datasets. The data log will spe
    - Data that passes review can reenter the raw data with the rest of the pull
    - Data log is updated with pass and fail details
 
-![Raw Data Pipeline](docs/images/data_pipeline_raw.png)
+![Raw Data Pipeline](images/data_pipeline_raw.png)
 
 3. **Processed data** starts from validated and cleaned raw data
    - Processed data flows through model development and may change with things like feature engineering and training/test splits
 
-![Processed Data Pipeline](docs/images/data_pipeline_processed.png)
+![Processed Data Pipeline](images/data_pipeline_processed.png)
 
 ---
 
