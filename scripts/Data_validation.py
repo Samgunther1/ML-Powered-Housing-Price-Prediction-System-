@@ -20,7 +20,7 @@ import logging
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
- 
+from homeharvest import scrape_property
 import pandas as pd
  
 try:
