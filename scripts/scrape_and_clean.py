@@ -36,6 +36,14 @@ OUTLIER_COLUMNS = [
     #"days_on_mls",
 ]
 
+VALID_STYLES = [
+    "SINGLE_FAMILY",
+    "CONDO",
+    "CONDOS",
+    "TOWNHOMES",
+    "MULTI_FAMILY",
+    "APARTMENNT",
+]
 
 def scrape_data(location: str, listing_type: str, past_days: int) -> pd.DataFrame:
     """Scrape housing data using HomeHarvest."""
@@ -107,6 +115,16 @@ def remove_missing_target(df: pd.DataFrame) -> pd.DataFrame:
         logger.info("No rows with missing sold_price")
     return df
 
+def filter_style(df: pd.DataFrame, valid_styles: list = VALID_STYLES) -> pd.DataFrame:
+    """Keep only rows with property styles relevant to price prediction."""
+    before = len(df)
+    df = df[df["style"].isin(valid_styles) | df["style"].isna()]
+    dropped = before - len(df)
+    if dropped > 0:
+        logger.info(f"Dropped {dropped} rows with excluded styles (kept: {valid_styles})")
+    else:
+        logger.info("No rows dropped by style filter")
+    return df
 
 def remove_outliers_iqr(
     df: pd.DataFrame,
@@ -187,7 +205,8 @@ def clean_data(
         1. Drop completely empty rows
         2. Deduplicate
         3. Remove rows without sold_price
-        4. Remove outliers (IQR)
+        4. Remove land,other styles
+        5. Remove outliers (IQR)
 
     Returns:
         Cleaned DataFrame
@@ -199,6 +218,7 @@ def clean_data(
     df = drop_empty_rows(df)
     df = deduplicate(df)
     df = remove_missing_target(df)
+    df = filter_style(df)
     df = remove_outliers_iqr(df, columns=OUTLIER_COLUMNS, multiplier=iqr_multiplier)
 
     df = df.reset_index(drop=True)
@@ -238,8 +258,7 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_file = output_dir / f"cleaned_{ts}.parquet"
-    df_clean.to_parquet(output_file, index=False)
+    
 
     # Also save a CSV for easy inspection
     csv_file = output_dir / f"cleaned_{ts}.csv"
@@ -249,7 +268,6 @@ def main():
     print(f"  Raw rows:      {len(df_raw)}")
     print(f"  Cleaned rows:  {len(df_clean)}")
     print(f"  Removed:       {len(df_raw) - len(df_clean)} ({100*(len(df_raw)-len(df_clean))/max(len(df_raw),1):.1f}%)")
-    print(f"  Parquet:       {output_file}")
     print(f"  CSV:           {csv_file}")
     print(f"{'='*60}\n")
 

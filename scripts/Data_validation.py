@@ -77,7 +77,7 @@ for _dir in [RAW_DIR, ERRORS_DIR, ARCHIVE_DIR, REPORT_DIR]:
 
 # Columns that MUST exist in the raw DataFrame
 REQUIRED_COLUMNS = [
-    "style",          # <-- fixed missing comma (was concatenating with list_price)
+    "style",          
     "list_price",
     "sold_price",
     "year_built",
@@ -112,14 +112,14 @@ NOT_NULL_EXPECTATIONS = {
     "style": 0.95,
     "sqft": 0.80,
     "beds": 0.85,
-    "full_baths": 0.85,        # <-- fixed: was "baths", HomeHarvest uses full_baths
+    "full_baths": 0.85,        
     "half_baths": 0.70,
 }
 
 # Numeric range checks: column -> (min, max, mostly)
 RANGE_EXPECTATIONS = {
-    "list_price": (10_000, 100_000_000, 1.0),
-    "sold_price": (10_000, 100_000_000, 1.0),
+    "list_price": (10_000, 10_000_000, 1.0),
+    "sold_price": (10_000, 10_000_000, 1.0),
     "sqft": (100, 50_000, 0.95),
     "beds": (0, 20, 0.99),
     "full_baths": (0, 20, 0.99),  # <-- fixed from "baths"
@@ -138,7 +138,7 @@ CATEGORICAL_EXPECTATIONS = {
             "LAND",
             "MULTI_FAMILY",
             "APARTMENT",
-            "OTHER",     # <-- fixed missing comma (was concatenating with CONDO)
+            "OTHER",     
             "CONDO",
             "TOWNHOMES",
         ],
