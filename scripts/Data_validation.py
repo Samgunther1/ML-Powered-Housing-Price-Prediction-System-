@@ -26,8 +26,8 @@ Usage:
 
     # Review quarantined files:
     python scripts/Data_validation.py --review
-    python scripts/Data_validation.py --approve data/errors/listings_20260406_150000.parquet
-    python scripts/Data_validation.py --reject data/errors/listings_20260406_150000.parquet
+    python scripts/Data_validation.py --approve data/errors/listings_20260406_150000.parquet --reason "Minor nulls in lot_sqft, acceptable for modeling"
+    python scripts/Data_validation.py --reject data/errors/listings_20260406_150000.parquet --reason "Sold_price distribution too skewed, re-scrape needed"
 """
 
 import hashlib
@@ -35,6 +35,7 @@ import json
 import logging
 import shutil
 import argparse
+import getpass
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Tuple
@@ -149,6 +150,12 @@ CATEGORICAL_EXPECTATIONS = {
 }
 
 MIN_ROW_COUNT = 50  # cleaned data should have a reasonable number of rows
+
+
+# ---------------------------------------------------------------------------
+# MLflow review experiment config
+# ---------------------------------------------------------------------------
+REVIEW_EXPERIMENT_NAME = "housing_quarantine_reviews"
 
 
 # ---------------------------------------------------------------------------
@@ -395,24 +402,194 @@ def validate_and_route(
     return success, filepath, summary
 
 
+def _find_matching_validation_report(quarantined_path: Path) -> Optional[dict]:
+    """
+    Find the original validation report for a quarantined file by matching
+    the data_path field in saved reports.
+    """
+    reports = sorted(REPORT_DIR.glob("validation_*.json"), key=lambda f: f.stat().st_mtime)
+    for rpt_path in reversed(reports):
+        try:
+            with open(rpt_path) as f:
+                data = json.load(f)
+            # Match by data_path or by filename substring
+            saved_data_path = data.get("data_path", "")
+            if (
+                str(quarantined_path) in saved_data_path
+                or quarantined_path.name in saved_data_path
+            ):
+                return data
+        except Exception:
+            continue
+    return None
+
+
+def _save_review_report(
+    quarantined_path: Path,
+    decision: str,
+    dest: Path,
+    reason: str,
+    reviewer: str,
+    original_report: Optional[dict],
+) -> Path:
+    """Save a review decision report as JSON."""
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    review_report = {
+        "review_timestamp": datetime.now().isoformat(),
+        "decision": decision,
+        "reason": reason,
+        "reviewer": reviewer,
+        "quarantined_file": str(quarantined_path),
+        "destination_file": str(dest),
+    }
+
+    # Carry forward context from the original validation report
+    if original_report:
+        review_report["original_validation"] = {
+            "timestamp": original_report.get("timestamp"),
+            "evaluated": original_report.get("evaluated"),
+            "passed": original_report.get("passed"),
+            "failed": original_report.get("failed"),
+            "failures": original_report.get("failures", []),
+            "dataset_hash": original_report.get("dataset_hash"),
+            "row_count": original_report.get("row_count"),
+        }
+
+    report_file = REPORT_DIR / f"review_{decision}_{ts}.json"
+    with open(report_file, "w") as f:
+        json.dump(review_report, f, indent=2, default=str)
+    logger.info(f"Review report saved to {report_file}")
+    return report_file
+
+
+def _log_review_to_mlflow(
+    quarantined_path: Path,
+    decision: str,
+    dest: Path,
+    reason: str,
+    reviewer: str,
+    review_report_path: Path,
+    original_report: Optional[dict],
+    experiment_name: str = REVIEW_EXPERIMENT_NAME,
+) -> None:
+    """Log the quarantine review decision to MLflow."""
+    try:
+        import mlflow
+    except ImportError:
+        logger.warning(
+            "mlflow not installed — review logged to JSON only. "
+            "Install with: pip install mlflow"
+        )
+        return
+
+    mlflow.set_experiment(experiment_name)
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_name = f"review_{decision}_{quarantined_path.stem}_{ts}"
+
+    with mlflow.start_run(run_name=run_name):
+        # --- Tags: decision metadata ---
+        mlflow.set_tag("review_decision", decision)
+        mlflow.set_tag("review_reason", reason)
+        mlflow.set_tag("reviewer", reviewer)
+        mlflow.set_tag("quarantined_file", str(quarantined_path))
+        mlflow.set_tag("destination_file", str(dest))
+
+        # --- Carry forward original validation context ---
+        if original_report:
+            dataset_hash = original_report.get("dataset_hash", "unknown")
+            mlflow.set_tag("dataset_hash", dataset_hash)
+            mlflow.log_param("dataset_hash", dataset_hash[:16])
+            mlflow.log_param("dataset_rows", original_report.get("row_count", 0))
+
+            mlflow.log_metrics({
+                "dq_expectations_total": original_report.get("evaluated", 0),
+                "dq_expectations_passed": original_report.get("passed", 0),
+                "dq_expectations_failed": original_report.get("failed", 0),
+                "dq_pass_rate": (
+                    original_report.get("passed", 0)
+                    / max(original_report.get("evaluated", 1), 1)
+                ),
+            })
+
+            # Log count of failures that were manually accepted
+            failures = original_report.get("failures", [])
+            if decision == "approved":
+                mlflow.log_metric("dq_failures_manually_accepted", len(failures))
+
+        # --- Log the review report as artifact ---
+        mlflow.log_artifact(str(review_report_path), artifact_path="quarantine_reviews")
+
+    logger.info(f"Review decision logged to MLflow experiment '{experiment_name}'")
+
+
 def review_quarantined(
     quarantined_path: str,
     approve: bool = True,
+    reason: str = "",
+    reviewer: str = "",
+    log_to_mlflow: bool = True,
 ) -> Path:
-    """Manual review: approve (move to processed/) or reject (move to archive/)."""
+    """
+    Manual review: approve (move to processed/) or reject (move to archive/).
+
+    Logs the decision, reason, and reviewer to both a JSON report and MLflow
+    so there is a full audit trail for the team.
+    """
     src = Path(quarantined_path)
     if not src.exists():
         raise FileNotFoundError(f"Quarantined file not found: {src}")
 
+    decision = "approved" if approve else "rejected"
+
+    # Default reviewer to the current OS user
+    if not reviewer:
+        try:
+            reviewer = getpass.getuser()
+        except Exception:
+            reviewer = "unknown"
+
+    # Prompt for reason if not provided (interactive usage)
+    if not reason:
+        reason = f"Manual {decision} — no reason provided"
+
     if approve:
         dest = PROCESSED_DIR / src.name
-        action = "APPROVED → moved to data/processed/"
     else:
         dest = ARCHIVE_DIR / src.name
-        action = "REJECTED → archived to data/archive/"
 
+    # Look up the original validation report for context
+    original_report = _find_matching_validation_report(src)
+
+    # Save JSON review report
+    review_report_path = _save_review_report(
+        quarantined_path=src,
+        decision=decision,
+        dest=dest,
+        reason=reason,
+        reviewer=reviewer,
+        original_report=original_report,
+    )
+
+    # Log to MLflow
+    if log_to_mlflow:
+        _log_review_to_mlflow(
+            quarantined_path=src,
+            decision=decision,
+            dest=dest,
+            reason=reason,
+            reviewer=reviewer,
+            review_report_path=review_report_path,
+            original_report=original_report,
+        )
+
+    # Move the file
     shutil.move(str(src), str(dest))
+    action = "APPROVED → data/processed/" if approve else "REJECTED → data/archive/"
     logger.info(f"Review: {action} ({dest})")
+    logger.info(f"  Reviewer: {reviewer}")
+    logger.info(f"  Reason:   {reason}")
+
     return dest
 
 
@@ -455,8 +632,10 @@ def list_quarantined() -> list:
                 break
 
     print(f"\n{'='*60}")
-    print(f"  To approve:  python scripts/Data_validation.py --approve <filepath>")
-    print(f"  To reject:   python scripts/Data_validation.py --reject <filepath>")
+    print(f"  To approve:  python scripts/Data_validation.py --approve <filepath> --reason \"...\"")
+    print(f"  To reject:   python scripts/Data_validation.py --reject <filepath> --reason \"...\"")
+    print(f"  Add --reviewer <name> to tag who reviewed (defaults to OS user)")
+    print(f"  Add --no-mlflow to skip MLflow logging")
     print(f"{'='*60}\n")
 
     return files
@@ -576,6 +755,12 @@ def main():
                         help="Approve a quarantined file (move to data/processed/)")
     parser.add_argument("--reject", type=str, default=None,
                         help="Reject a quarantined file (move to data/archive/)")
+    parser.add_argument("--reason", type=str, default="",
+                        help="Reason for approve/reject decision (logged to MLflow)")
+    parser.add_argument("--reviewer", type=str, default="",
+                        help="Name of the reviewer (defaults to OS username)")
+    parser.add_argument("--no-mlflow", action="store_true",
+                        help="Skip MLflow logging for review decisions")
 
     args = parser.parse_args()
 
@@ -585,11 +770,23 @@ def main():
         return
 
     if args.approve:
-        review_quarantined(args.approve, approve=True)
+        review_quarantined(
+            args.approve,
+            approve=True,
+            reason=args.reason,
+            reviewer=args.reviewer,
+            log_to_mlflow=not args.no_mlflow,
+        )
         return
 
     if args.reject:
-        review_quarantined(args.reject, approve=False)
+        review_quarantined(
+            args.reject,
+            approve=False,
+            reason=args.reason,
+            reviewer=args.reviewer,
+            log_to_mlflow=not args.no_mlflow,
+        )
         return
 
     # --- Validation mode ---
