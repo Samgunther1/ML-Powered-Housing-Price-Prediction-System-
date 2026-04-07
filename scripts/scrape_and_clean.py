@@ -5,15 +5,25 @@ Scrapes housing data from Realtor.com via HomeHarvest, then applies cleaning ste
     1. Drop completely empty rows
     2. Deduplicate rows
     3. Remove rows missing sold_price (target variable)
-    4. Remove outliers via IQR method for numeric columns
+    4. Filter to valid property styles
+    5. Remove outliers via IQR method for numeric columns
+
+Optionally logs full cleaning lineage to MLflow:
+    - Raw vs cleaned row counts
+    - Rows dropped per step
+    - IQR bounds for each column
+    - Dataset hashes (raw + cleaned) for versioning
+    - Cleaned parquet as an artifact
 
 Usage:
     python scripts/scrape_and_clean.py --location "Cincinnati, OH" --past_days 365
-    python scripts/scrape_and_clean.py --location "Cincinnati, OH" --past_days 365 --iqr_multiplier 2.0
-    python scripts/scrape_and_clean.py --location "Cincinnati, OH" --listing_type sold --past_days 180 --output data/cleaned
+    python scripts/scrape_and_clean.py --location "Cincinnati, OH" --past_days 365 --mlflow
+    python scripts/scrape_and_clean.py --location "Cincinnati, OH" --past_days 365 --mlflow --iqr_multiplier 2.0
 """
 
 import argparse
+import hashlib
+import json
 import logging
 from datetime import datetime
 from pathlib import Path
@@ -23,11 +33,14 @@ import pandas as pd
 logging.basicConfig(level=logging.INFO, format="%(asctime)s — %(levelname)s — %(message)s")
 logger = logging.getLogger(__name__)
 
-# Columns to check for outliers via IQR
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
 OUTLIER_COLUMNS = [
     "sold_price",
     "sqft",
-    #"beds",
+   # "beds",
     #"full_baths",
     #"half_baths",
     #"lot_sqft",
@@ -42,8 +55,26 @@ VALID_STYLES = [
     "CONDOS",
     "TOWNHOMES",
     "MULTI_FAMILY",
-    "APARTMENNT",
+    "APARTMENT",
 ]
+
+REPORT_DIR = Path("cleaning_reports")
+REPORT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# Data hashing
+# ---------------------------------------------------------------------------
+
+def compute_dataset_hash(df: pd.DataFrame) -> str:
+    """Compute a deterministic SHA-256 hash of a DataFrame for versioning."""
+    csv_bytes = df.to_csv(index=False).encode("utf-8")
+    return hashlib.sha256(csv_bytes).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# Scraping
+# ---------------------------------------------------------------------------
 
 def scrape_data(location: str, listing_type: str, past_days: int) -> pd.DataFrame:
     """Scrape housing data using HomeHarvest."""
@@ -62,27 +93,23 @@ def scrape_data(location: str, listing_type: str, past_days: int) -> pd.DataFram
     return df
 
 
-def drop_empty_rows(df: pd.DataFrame) -> pd.DataFrame:
+# ---------------------------------------------------------------------------
+# Cleaning steps (each returns df + count of rows dropped)
+# ---------------------------------------------------------------------------
+
+def drop_empty_rows(df: pd.DataFrame) -> tuple:
     """Drop rows where every column is NaN."""
     before = len(df)
     df = df.dropna(how="all")
     dropped = before - len(df)
-    if dropped > 0:
-        logger.info(f"Dropped {dropped} completely empty rows")
-    else:
-        logger.info("No completely empty rows found")
-    return df
+    logger.info(f"Empty rows: dropped {dropped}")
+    return df, dropped
 
 
-def deduplicate(df: pd.DataFrame) -> pd.DataFrame:
-    """Remove duplicate rows, keeping the first occurrence.
-    
-    Excludes columns containing unhashable types (lists, dicts)
-    that HomeHarvest sometimes returns (e.g. nearby_schools, agents, photos).
-    """
+def deduplicate(df: pd.DataFrame) -> tuple:
+    """Remove duplicate rows, skipping unhashable columns (lists, dicts)."""
     before = len(df)
 
-    # Find columns that only contain hashable values
     hashable_cols = []
     for col in df.columns:
         sample = df[col].dropna()
@@ -93,93 +120,71 @@ def deduplicate(df: pd.DataFrame) -> pd.DataFrame:
         if not isinstance(first_val, (list, dict, set)):
             hashable_cols.append(col)
         else:
-            logger.info(f"Skipping column '{col}' during dedup (contains {type(first_val).__name__})")
+            logger.info(f"  Skipping column '{col}' during dedup (contains {type(first_val).__name__})")
 
     df = df.drop_duplicates(subset=hashable_cols)
     dropped = before - len(df)
-    if dropped > 0:
-        logger.info(f"Dropped {dropped} duplicate rows (checked {len(hashable_cols)}/{len(df.columns)} columns)")
-    else:
-        logger.info("No duplicate rows found")
-    return df
+    logger.info(f"Duplicates: dropped {dropped} (checked {len(hashable_cols)}/{len(df.columns)} columns)")
+    return df, dropped
 
 
-def remove_missing_target(df: pd.DataFrame) -> pd.DataFrame:
+def remove_missing_target(df: pd.DataFrame) -> tuple:
     """Remove rows where sold_price is null."""
     before = len(df)
     df = df.dropna(subset=["sold_price"])
     dropped = before - len(df)
-    if dropped > 0:
-        logger.info(f"Dropped {dropped} rows with missing sold_price")
-    else:
-        logger.info("No rows with missing sold_price")
-    return df
+    logger.info(f"Missing sold_price: dropped {dropped}")
+    return df, dropped
 
-def filter_style(df: pd.DataFrame, valid_styles: list = VALID_STYLES) -> pd.DataFrame:
+
+def filter_style(df: pd.DataFrame, valid_styles: list = VALID_STYLES) -> tuple:
     """Keep only rows with property styles relevant to price prediction."""
     before = len(df)
     df = df[df["style"].isin(valid_styles) | df["style"].isna()]
     dropped = before - len(df)
-    if dropped > 0:
-        logger.info(f"Dropped {dropped} rows with excluded styles (kept: {valid_styles})")
-    else:
-        logger.info("No rows dropped by style filter")
-    return df
+    logger.info(f"Style filter: dropped {dropped} (kept: {valid_styles})")
+    return df, dropped
+
 
 def remove_outliers_iqr(
     df: pd.DataFrame,
     columns: list,
     multiplier: float = 1.5,
-) -> pd.DataFrame:
+) -> tuple:
     """
     Remove outliers using the IQR method.
 
-    For each column, values outside [Q1 - multiplier*IQR, Q3 + multiplier*IQR]
-    are considered outliers. Rows with an outlier in ANY of the specified columns
-    are removed.
-
-    NaN values in a given column are ignored (not treated as outliers).
-
-    Args:
-        df: Input DataFrame
-        columns: Columns to check for outliers
-        multiplier: IQR multiplier (1.5 = standard, 2.0 = more lenient)
-
     Returns:
-        DataFrame with outlier rows removed
+        (cleaned_df, total_dropped, outlier_report)
+        outlier_report is a dict of col -> {outliers_found, lower_bound, upper_bound, Q1, Q3}
     """
     before = len(df)
     mask = pd.Series(True, index=df.index)
-
     outlier_report = {}
 
     for col in columns:
         if col not in df.columns:
-            logger.warning(f"Column '{col}' not found in DataFrame — skipping outlier check")
+            logger.warning(f"Column '{col}' not found — skipping outlier check")
             continue
 
-        # Only consider non-null values for IQR calculation
         series = pd.to_numeric(df[col], errors="coerce")
-
         q1 = series.quantile(0.25)
         q3 = series.quantile(0.75)
         iqr = q3 - q1
-
         lower = q1 - multiplier * iqr
         upper = q3 + multiplier * iqr
 
-        # Keep rows that are within bounds OR are NaN (don't penalize missing data here)
         col_mask = (series >= lower) & (series <= upper) | series.isna()
         col_outliers = (~col_mask).sum()
 
-        if col_outliers > 0:
-            outlier_report[col] = {
-                "outliers_found": int(col_outliers),
-                "lower_bound": round(lower, 2),
-                "upper_bound": round(upper, 2),
-                "Q1": round(q1, 2),
-                "Q3": round(q3, 2),
-            }
+        outlier_report[col] = {
+            "outliers_found": int(col_outliers),
+            "lower_bound": round(float(lower), 2),
+            "upper_bound": round(float(upper), 2),
+            "Q1": round(float(q1), 2),
+            "Q3": round(float(q3), 2),
+            "IQR": round(float(iqr), 2),
+        }
 
         mask = mask & col_mask
 
@@ -188,47 +193,163 @@ def remove_outliers_iqr(
 
     logger.info(f"Outlier removal (IQR x{multiplier}): dropped {total_dropped} rows total")
     for col, info in outlier_report.items():
-        logger.info(
-            f"  {col}: {info['outliers_found']} outliers | "
-            f"bounds=[{info['lower_bound']}, {info['upper_bound']}]"
-        )
+        if info["outliers_found"] > 0:
+            logger.info(
+                f"  {col}: {info['outliers_found']} outliers | "
+                f"bounds=[{info['lower_bound']}, {info['upper_bound']}]"
+            )
 
-    return df
+    return df, total_dropped, outlier_report
 
+
+# ---------------------------------------------------------------------------
+# Full cleaning pipeline
+# ---------------------------------------------------------------------------
 
 def clean_data(
     df: pd.DataFrame,
     iqr_multiplier: float = 1.5,
-) -> pd.DataFrame:
+) -> tuple:
     """
-    Full cleaning pipeline:
-        1. Drop completely empty rows
-        2. Deduplicate
-        3. Remove rows without sold_price
-        4. Remove land,other styles
-        5. Remove outliers (IQR)
+    Full cleaning pipeline. Returns (cleaned_df, cleaning_log).
 
-    Returns:
-        Cleaned DataFrame
+    cleaning_log captures every step for MLflow logging.
     """
+    cleaning_log = {
+        "raw_rows": len(df),
+        "raw_columns": len(df.columns),
+        "raw_hash": compute_dataset_hash(df),
+        "iqr_multiplier": iqr_multiplier,
+        "valid_styles": VALID_STYLES,
+        "outlier_columns": OUTLIER_COLUMNS,
+        "steps": {},
+    }
+
     logger.info(f"{'='*60}")
     logger.info(f"Starting cleaning pipeline — {len(df)} rows in")
     logger.info(f"{'='*60}")
 
-    df = drop_empty_rows(df)
-    df = deduplicate(df)
-    df = remove_missing_target(df)
-    df = filter_style(df)
-    df = remove_outliers_iqr(df, columns=OUTLIER_COLUMNS, multiplier=iqr_multiplier)
+    # Step 1: Empty rows
+    df, dropped = drop_empty_rows(df)
+    cleaning_log["steps"]["empty_rows_dropped"] = dropped
+
+    # Step 2: Dedup
+    df, dropped = deduplicate(df)
+    cleaning_log["steps"]["duplicates_dropped"] = dropped
+
+    # Step 3: Missing target
+    df, dropped = remove_missing_target(df)
+    cleaning_log["steps"]["missing_target_dropped"] = dropped
+
+    # Step 4: Style filter
+    df, dropped = filter_style(df)
+    cleaning_log["steps"]["style_filter_dropped"] = dropped
+
+    # Step 5: Outliers
+    df, dropped, outlier_report = remove_outliers_iqr(
+        df, columns=OUTLIER_COLUMNS, multiplier=iqr_multiplier
+    )
+    cleaning_log["steps"]["outliers_dropped"] = dropped
+    cleaning_log["outlier_details"] = outlier_report
 
     df = df.reset_index(drop=True)
 
+    # Final stats
+    cleaning_log["cleaned_rows"] = len(df)
+    cleaning_log["cleaned_columns"] = len(df.columns)
+    cleaning_log["cleaned_hash"] = compute_dataset_hash(df)
+    cleaning_log["total_rows_removed"] = cleaning_log["raw_rows"] - len(df)
+    cleaning_log["removal_pct"] = round(
+        100 * cleaning_log["total_rows_removed"] / max(cleaning_log["raw_rows"], 1), 2
+    )
+    cleaning_log["timestamp"] = datetime.now().isoformat()
+
     logger.info(f"{'='*60}")
-    logger.info(f"Cleaning complete — {len(df)} rows remaining")
+    logger.info(f"Cleaning complete — {len(df)} rows remaining ({cleaning_log['removal_pct']}% removed)")
     logger.info(f"{'='*60}")
 
-    return df
+    return df, cleaning_log
 
+
+# ---------------------------------------------------------------------------
+# MLflow logging
+# ---------------------------------------------------------------------------
+
+def log_cleaning_to_mlflow(
+    cleaning_log: dict,
+    cleaned_file: str,
+    experiment_name: str = "housing_data_cleaning",
+    run_id: str = None,
+):
+    """
+    Log the full cleaning lineage to MLflow.
+
+    Logs:
+        - Params: location, listing_type, past_days, iqr_multiplier, dataset hashes
+        - Metrics: row counts, rows dropped per step, removal %
+        - Artifacts: cleaning report JSON, cleaned parquet
+        - Tags: raw/cleaned hashes for cross-run linking
+    """
+    try:
+        import mlflow
+    except ImportError:
+        raise ImportError("mlflow is required. Install with: pip install mlflow")
+
+    # Save cleaning report to disk for artifact logging
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    report_file = REPORT_DIR / f"cleaning_report_{ts}.json"
+    with open(report_file, "w") as f:
+        json.dump(cleaning_log, f, indent=2, default=str)
+
+    def _log():
+        # --- Params ---
+        mlflow.log_param("iqr_multiplier", cleaning_log["iqr_multiplier"])
+        mlflow.log_param("raw_hash", cleaning_log["raw_hash"][:16])
+        mlflow.log_param("cleaned_hash", cleaning_log["cleaned_hash"][:16])
+        mlflow.log_param("valid_styles", ", ".join(cleaning_log["valid_styles"]))
+        mlflow.log_param("outlier_columns", ", ".join(cleaning_log["outlier_columns"]))
+
+        # --- Metrics: row counts ---
+        mlflow.log_metrics({
+            "raw_rows": cleaning_log["raw_rows"],
+            "cleaned_rows": cleaning_log["cleaned_rows"],
+            "total_rows_removed": cleaning_log["total_rows_removed"],
+            "removal_pct": cleaning_log["removal_pct"],
+        })
+
+        # --- Metrics: rows dropped per step ---
+        for step_name, count in cleaning_log["steps"].items():
+            mlflow.log_metric(f"step_{step_name}", count)
+
+        # --- Metrics: outlier bounds per column ---
+        for col, details in cleaning_log.get("outlier_details", {}).items():
+            mlflow.log_metric(f"outlier_{col}_count", details["outliers_found"])
+            mlflow.log_metric(f"outlier_{col}_lower", details["lower_bound"])
+            mlflow.log_metric(f"outlier_{col}_upper", details["upper_bound"])
+
+        # --- Tags for cross-run linking ---
+        mlflow.set_tag("raw_dataset_hash", cleaning_log["raw_hash"])
+        mlflow.set_tag("cleaned_dataset_hash", cleaning_log["cleaned_hash"])
+        mlflow.set_tag("pipeline_stage", "data_cleaning")
+
+        # --- Artifacts ---
+        mlflow.log_artifact(str(report_file), artifact_path="data_cleaning")
+        mlflow.log_artifact(cleaned_file, artifact_path="data_cleaning")
+
+    if run_id:
+        with mlflow.start_run(run_id=run_id):
+            _log()
+    else:
+        mlflow.set_experiment(experiment_name)
+        with mlflow.start_run(run_name=f"data_cleaning_{ts}"):
+            _log()
+
+    logger.info(f"Cleaning lineage logged to MLflow (experiment: {experiment_name})")
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(
@@ -244,6 +365,10 @@ def main():
                         help="IQR multiplier for outlier removal (1.5=standard, 2.0=lenient)")
     parser.add_argument("--output", type=str, default="data/cleaned",
                         help="Output directory for the cleaned parquet file")
+    parser.add_argument("--mlflow", action="store_true",
+                        help="Log cleaning lineage to MLflow")
+    parser.add_argument("--experiment", type=str, default="housing_data_cleaning",
+                        help="MLflow experiment name")
 
     args = parser.parse_args()
 
@@ -251,24 +376,46 @@ def main():
     df_raw = scrape_data(args.location, args.listing_type, args.past_days)
 
     # --- Clean ---
-    df_clean = clean_data(df_raw, iqr_multiplier=args.iqr_multiplier)
+    df_clean, cleaning_log = clean_data(df_raw, iqr_multiplier=args.iqr_multiplier)
+
+    # Add scrape params to the log
+    cleaning_log["scrape_params"] = {
+        "location": args.location,
+        "listing_type": args.listing_type,
+        "past_days": args.past_days,
+    }
 
     # --- Save ---
     output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    
 
-    # Also save a CSV for easy inspection
     csv_file = output_dir / f"cleaned_{ts}.csv"
     df_clean.to_csv(csv_file, index=False)
 
+    # --- MLflow ---
+    if args.mlflow:
+        log_cleaning_to_mlflow(
+            cleaning_log,
+            cleaned_file=str(csv_file),
+            experiment_name=args.experiment,
+        )
+
+    # --- Summary ---
     print(f"\n{'='*60}")
-    print(f"  Raw rows:      {len(df_raw)}")
-    print(f"  Cleaned rows:  {len(df_clean)}")
-    print(f"  Removed:       {len(df_raw) - len(df_clean)} ({100*(len(df_raw)-len(df_clean))/max(len(df_raw),1):.1f}%)")
+    print(f"  Location:      {args.location}")
+    print(f"  Raw rows:      {cleaning_log['raw_rows']}")
+    print(f"  Cleaned rows:  {cleaning_log['cleaned_rows']}")
+    print(f"  Removed:       {cleaning_log['total_rows_removed']} ({cleaning_log['removal_pct']}%)")
+    print(f"  Breakdown:")
+    for step, count in cleaning_log["steps"].items():
+        print(f"    {step}: {count}")
+    print(f"  Raw hash:      {cleaning_log['raw_hash'][:16]}...")
+    print(f"  Cleaned hash:  {cleaning_log['cleaned_hash'][:16]}...")
     print(f"  CSV:           {csv_file}")
+    if args.mlflow:
+        print(f"  MLflow:        ✅ logged to '{args.experiment}'")
     print(f"{'='*60}\n")
 
 

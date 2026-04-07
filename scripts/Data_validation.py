@@ -2,10 +2,10 @@
 validate_housing_data.py
 
 Great Expectations validation module for the HomeHarvest housing price prediction pipeline.
-Validates raw scraped data from Realtor.com before feature engineering and model training.
+Validates CLEANED data (output of scrape_and_clean.py) before feature engineering and model training.
 
 Workflow (quarantine pattern):
-    Incoming data (API scrape)
+    Cleaned data (from scrape_and_clean.py)
         |
     Validation checks
         |
@@ -18,14 +18,16 @@ Workflow (quarantine pattern):
                        +---> Rejected  --> archived or deleted
 
 Usage:
-    # Standalone scrape + validate + route:
-    python validate_housing_data.py --location "Cincinnati, OH" --past_days 365
+    # Validate the most recent cleaned file (default):
+    python scripts/Data_validation.py --mlflow
 
-    # In your pipeline:
-    from validate_housing_data import validate_and_route, review_quarantined
+    # Validate a specific file:
+    python scripts/Data_validation.py --file data/cleaned/cleaned_20260406_150000.parquet --mlflow
 
-    df_valid = validate_and_route(df)            # routes to raw/ or errors/
-    review_quarantined("data/errors/some_file")  # approve or reject
+    # Review quarantined files:
+    python scripts/Data_validation.py --review
+    python scripts/Data_validation.py --approve data/errors/listings_20260406_150000.parquet
+    python scripts/Data_validation.py --reject data/errors/listings_20260406_150000.parquet
 """
 
 import hashlib
@@ -42,42 +44,42 @@ import pandas as pd
 try:
     import great_expectations as gx
     from great_expectations.expectations import (
-    ExpectColumnToExist,
-    ExpectColumnValuesToBeBetween,
-    ExpectColumnValuesToBeInSet,
-    ExpectColumnValuesToNotBeNull,
-    ExpectTableColumnCountToBeBetween,
-    ExpectTableRowCountToBeBetween,       # <-- changed
-)
+        ExpectColumnToExist,
+        ExpectColumnValuesToBeBetween,
+        ExpectColumnValuesToBeInSet,
+        ExpectColumnValuesToNotBeNull,
+        ExpectTableColumnCountToBeBetween,
+        ExpectTableRowCountToBeBetween,
+    )
 except ImportError:
     raise ImportError(
         "great_expectations is required. Install with: pip install great_expectations"
     )
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s — %(levelname)s — %(message)s")
 logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Directory structure for quarantine workflow
+# Directory structure
 # ---------------------------------------------------------------------------
 DATA_DIR = Path("data")
-RAW_DIR = DATA_DIR / "raw"         # validated, clean data lands here
-ERRORS_DIR = DATA_DIR / "errors"   # failed validation, quarantined for review
-ARCHIVE_DIR = DATA_DIR / "archive" # rejected data after manual review
+CLEANED_DIR = DATA_DIR / "cleaned"   # input: output of scrape_and_clean.py
+RAW_DIR = DATA_DIR / "raw"           # validated, ready for modeling
+ERRORS_DIR = DATA_DIR / "errors"     # failed validation, quarantined
+ARCHIVE_DIR = DATA_DIR / "archive"   # rejected after manual review
 REPORT_DIR = Path("validation_reports")
 
-for _dir in [RAW_DIR, ERRORS_DIR, ARCHIVE_DIR, REPORT_DIR]:
+for _dir in [CLEANED_DIR, RAW_DIR, ERRORS_DIR, ARCHIVE_DIR, REPORT_DIR]:
     _dir.mkdir(parents=True, exist_ok=True)
 
 
 # ---------------------------------------------------------------------------
-# Configuration: columns and validation rules
+# Configuration: columns and validation rules (tuned for CLEANED data)
 # ---------------------------------------------------------------------------
 
-# Columns that MUST exist in the raw DataFrame
 REQUIRED_COLUMNS = [
-    "style",          
+    "style",
     "list_price",
     "sold_price",
     "year_built",
@@ -99,50 +101,45 @@ REQUIRED_COLUMNS = [
     "status",
 ]
 
-# Columns that should not be null (column -> mostly threshold)
-# "mostly" = fraction of non-null values required (1.0 = zero nulls allowed)
+# Tighter null thresholds since data is already cleaned
 NOT_NULL_EXPECTATIONS = {
-    "sold_price": 1.0,         # target variable — no nulls
-    "formatted_address": 0.95,
-    "city": 0.95,
-    "county": 0.95,
-    "state": 0.99,
-    "zip_code": 0.95,
-    "status": 0.99,
-    "style": 0.95,
-    "sqft": 0.80,
-    "beds": 0.85,
-    "full_baths": 0.85,        
-    "half_baths": 0.70,
+    "sold_price": 1.0,
+    "formatted_address": 0.98,
+    "city": 0.98,
+    "county": 0.98,
+    "state": 1.0,
+    "zip_code": 0.98,
+    "status": 1.0,
+    "style": 0.98,
+    "sqft": 0.85,
+    "beds": 0.90,
+    "full_baths": 0.90,
+    "half_baths": 0.80,
 }
 
-# Numeric range checks: column -> (min, max, mostly)
+# Range checks — outliers should already be removed, so these act as a safety net
 RANGE_EXPECTATIONS = {
-    "list_price": (10_000, 10_000_000, 1.0),
-    "sold_price": (10_000, 10_000_000, 1.0),
-    "sqft": (100, 50_000, 0.95),
-    "beds": (0, 20, 0.99),
-    "full_baths": (0, 20, 0.99),  # <-- fixed from "baths"
-    "half_baths": (0, 10, 0.99),
-    "year_built": (1800, 2027, 0.90),
-    "lot_sqft": (0, 5_000_000, 0.80),
-    "stories": (0, 10, 0.90),
+    "list_price": (10_000, 100_000_000, 1.0),
+    "sold_price": (10_000, 100_000_000, 1.0),
+    "sqft": (100, 50_000, 0.98),
+    "beds": (0, 20, 1.0),
+    "full_baths": (0, 20, 1.0),
+    "half_baths": (0, 10, 1.0),
+    "year_built": (1800, 2027, 0.95),
+    "lot_sqft": (0, 5_000_000, 0.85),
+    "stories": (0, 10, 0.95),
 }
 
-# Categorical value checks: column -> (allowed_values, mostly)
 CATEGORICAL_EXPECTATIONS = {
     "style": (
         [
             "SINGLE_FAMILY",
-            "CONDOS",
-            "LAND",
-            "MULTI_FAMILY",
-            "APARTMENT",
-            "OTHER",     
             "CONDO",
+            "CONDOS",
             "TOWNHOMES",
+            "MULTI_FAMILY",
         ],
-        0.90,
+        0.98,
     ),
     "status": (
         ["SOLD"],
@@ -150,8 +147,26 @@ CATEGORICAL_EXPECTATIONS = {
     ),
 }
 
-# Minimum number of rows expected from a scrape
-MIN_ROW_COUNT = 1
+MIN_ROW_COUNT = 50  # cleaned data should have a reasonable number of rows
+
+
+# ---------------------------------------------------------------------------
+# Find the most recent cleaned file
+# ---------------------------------------------------------------------------
+
+def find_latest_cleaned_file(directory: Path = CLEANED_DIR) -> Path:
+    """Find the most recently created parquet file in the cleaned directory."""
+    parquet_files = sorted(directory.glob("*.parquet"), key=lambda f: f.stat().st_mtime)
+
+    if not parquet_files:
+        raise FileNotFoundError(
+            f"No parquet files found in {directory}. "
+            f"Run scrape_and_clean.py first."
+        )
+
+    latest = parquet_files[-1]
+    logger.info(f"Found latest cleaned file: {latest}")
+    return latest
 
 
 # ---------------------------------------------------------------------------
@@ -160,7 +175,6 @@ MIN_ROW_COUNT = 1
 
 def compute_dataset_hash(df: pd.DataFrame) -> str:
     """Compute a deterministic SHA-256 hash of a DataFrame for versioning."""
-    # Sort columns for consistency, then hash the CSV bytes
     csv_bytes = df.to_csv(index=False).encode("utf-8")
     return hashlib.sha256(csv_bytes).hexdigest()
 
@@ -171,6 +185,7 @@ def build_schema_snapshot(df: pd.DataFrame) -> dict:
         "columns": list(df.columns),
         "dtypes": {col: str(dtype) for col, dtype in df.dtypes.items()},
         "null_counts": df.isnull().sum().to_dict(),
+        "null_pcts": (df.isnull().sum() / len(df) * 100).round(2).to_dict(),
         "shape": list(df.shape),
     }
 
@@ -180,12 +195,11 @@ def build_schema_snapshot(df: pd.DataFrame) -> dict:
 # ---------------------------------------------------------------------------
 
 def build_expectation_suite(
-    context: gx.data_context,
-    suite_name: str = "housing_ingestion_suite",
+    context: gx.DataContext,
+    suite_name: str = "housing_cleaned_suite",
 ) -> gx.ExpectationSuite:
-    """Build and return the Expectation Suite for housing data validation."""
+    """Build and return the Expectation Suite for cleaned housing data."""
 
-    # Remove existing suite if present (idempotent rebuilds)
     try:
         existing = context.suites.get(suite_name)
         if existing:
@@ -197,10 +211,10 @@ def build_expectation_suite(
 
     # --- Row count ---
     suite.add_expectation(
-    ExpectTableRowCountToBeBetween(min_value=MIN_ROW_COUNT)
-)
+        ExpectTableRowCountToBeBetween(min_value=MIN_ROW_COUNT)
+    )
 
-    # --- Column count sanity check ---
+    # --- Column count ---
     suite.add_expectation(
         ExpectTableColumnCountToBeBetween(min_value=len(REQUIRED_COLUMNS))
     )
@@ -244,28 +258,22 @@ def build_expectation_suite(
 
 def run_validation(
     df: pd.DataFrame,
-    suite_name: str = "housing_ingestion_suite",
-    context: Optional[gx.data_context] = None,
+    suite_name: str = "housing_cleaned_suite",
+    context: Optional[gx.DataContext] = None,
 ) -> Tuple[bool, object, dict]:
-    """
-    Run Great Expectations validation on a raw housing DataFrame.
-
-    Returns:
-        (success, results, summary)
-    """
+    """Run Great Expectations validation on a cleaned housing DataFrame."""
     if context is None:
         context = gx.get_context()
 
     suite = build_expectation_suite(context, suite_name)
 
-    # Wire up the DataFrame as a pandas data source
     ds_name = "housing_pandas_ds"
     try:
         datasource = context.data_sources.get(ds_name)
     except Exception:
         datasource = context.data_sources.add_pandas(ds_name)
 
-    asset_name = "raw_listings"
+    asset_name = "cleaned_listings"
     try:
         data_asset = datasource.get_asset(asset_name)
     except Exception:
@@ -279,7 +287,6 @@ def run_validation(
             batch_def_name
         )
 
-    # Create validation definition
     vd_name = f"validate_{suite_name}"
     try:
         context.validation_definitions.delete(vd_name)
@@ -296,7 +303,6 @@ def run_validation(
 
     results = validation_definition.run(batch_parameters={"dataframe": df})
 
-    # Build summary
     summary = {
         "success": results.success,
         "evaluated": results.statistics["evaluated_expectations"],
@@ -324,7 +330,7 @@ def run_validation(
 
 
 # ---------------------------------------------------------------------------
-# Quarantine workflow: route data based on validation outcome
+# Quarantine workflow
 # ---------------------------------------------------------------------------
 
 def _save_parquet(df: pd.DataFrame, directory: Path, label: str) -> Path:
@@ -352,20 +358,12 @@ def validate_and_route(
     label: str = "listings",
 ) -> Tuple[bool, Path, dict]:
     """
-    Validate a housing DataFrame and route it to the appropriate directory.
+    Validate a cleaned DataFrame and route to raw/ or errors/.
 
     Pass -> data/raw/
     Fail -> data/errors/ (quarantined)
-
-    Args:
-        df: Raw DataFrame from HomeHarvest
-        strict: If True, raise on validation failure
-        label: Prefix for the saved parquet filename
-
-    Returns:
-        (passed: bool, filepath: Path, summary: dict)
     """
-    logger.info(f"Validating housing data: {len(df)} rows, {len(df.columns)} columns")
+    logger.info(f"Validating cleaned data: {len(df)} rows, {len(df.columns)} columns")
 
     success, results, summary = run_validation(df)
     report_path = _save_report(summary)
@@ -400,16 +398,7 @@ def review_quarantined(
     quarantined_path: str,
     approve: bool = True,
 ) -> Path:
-    """
-    Manual review step: approve or reject a quarantined dataset.
-
-    Args:
-        quarantined_path: Path to a file in data/errors/
-        approve: True to move to data/raw/, False to move to data/archive/
-
-    Returns:
-        New file path after move
-    """
+    """Manual review: approve (move to raw/) or reject (move to archive/)."""
     src = Path(quarantined_path)
     if not src.exists():
         raise FileNotFoundError(f"Quarantined file not found: {src}")
@@ -426,43 +415,80 @@ def review_quarantined(
     return dest
 
 
+def list_quarantined() -> list:
+    """List all files currently in the errors/ quarantine directory."""
+    files = sorted(ERRORS_DIR.glob("*.parquet"), key=lambda f: f.stat().st_mtime)
+    if not files:
+        print("\nNo quarantined files found in data/errors/\n")
+        return files
+
+    print(f"\n{'='*60}")
+    print(f"  Quarantined files ({len(files)})")
+    print(f"{'='*60}")
+
+    # Find all validation reports to match against quarantined files
+    reports = sorted(REPORT_DIR.glob("validation_*.json"), key=lambda f: f.stat().st_mtime)
+    report_data = {}
+    for rpt_path in reports:
+        try:
+            with open(rpt_path) as rpt:
+                data = json.load(rpt)
+            if not data.get("success", True):
+                report_data[rpt_path.name] = data
+        except Exception:
+            pass
+
+    for f in files:
+        size_kb = f.stat().st_size / 1024
+        print(f"\n  File: {f}")
+        print(f"  Size: {size_kb:.0f} KB")
+
+        # Try to find matching report by looking for closest timestamp
+        for rpt_name, rpt_data in report_data.items():
+            failures = rpt_data.get("failures", [])
+            if failures:
+                print(f"  Failures ({len(failures)}):")
+                for fail in failures:
+                    print(f"    ❌ {fail['expectation']}")
+                    print(f"       {fail['kwargs']}")
+                break
+
+    print(f"\n{'='*60}")
+    print(f"  To approve:  python scripts/Data_validation.py --approve <filepath>")
+    print(f"  To reject:   python scripts/Data_validation.py --reject <filepath>")
+    print(f"{'='*60}\n")
+
+    return files
+
+
 # ---------------------------------------------------------------------------
 # MLflow integration with data versioning
 # ---------------------------------------------------------------------------
 
 def validate_and_log_to_mlflow(
     df: pd.DataFrame,
+    source_file: str = "",
     run_id: Optional[str] = None,
     experiment_name: Optional[str] = None,
     strict: bool = False,
     label: str = "listings",
 ) -> Tuple[bool, Path, dict]:
     """
-    Full pipeline step: validate, route (quarantine pattern), and log to MLflow.
+    Full pipeline step: validate, route (quarantine), and log to MLflow.
 
-    MLflow logs include:
-        - Data quality metrics (pass rate, row count, etc.)
-        - Dataset hash for reproducibility / versioning
-        - Schema snapshot (columns, dtypes, null counts)
-        - Validation report JSON as artifact
-        - Data file path as a tag
-
-    Args:
-        df: Raw DataFrame from HomeHarvest
-        run_id: Existing MLflow run ID (if None, creates new run)
-        experiment_name: MLflow experiment name (used when run_id is None)
-        strict: Raise on validation failure
-        label: Prefix for saved parquet filename
-
-    Returns:
-        (passed, filepath, summary)
+    MLflow logs:
+        - Data quality metrics (pass rate, row/col count)
+        - Dataset hash for versioning
+        - Schema snapshot
+        - Validation report as artifact
+        - Source file path
     """
     try:
         import mlflow
     except ImportError:
         raise ImportError("mlflow is required. Install with: pip install mlflow")
 
-    # Step 1: validate and route to raw/ or errors/
+    # Step 1: validate and route
     success, filepath, summary = validate_and_route(df, strict=False, label=label)
 
     # Step 2: build versioning artifacts
@@ -473,9 +499,8 @@ def validate_and_log_to_mlflow(
     with open(schema_file, "w") as f:
         json.dump(schema, f, indent=2, default=str)
 
-    # Step 3: log everything to MLflow
+    # Step 3: log to MLflow
     def _log():
-        # Metrics
         mlflow.log_metrics(
             {
                 "dq_expectations_total": summary["evaluated"],
@@ -487,19 +512,18 @@ def validate_and_log_to_mlflow(
             }
         )
 
-        # Tags for quick filtering in the MLflow UI
         mlflow.set_tag("data_validation_passed", str(success))
         mlflow.set_tag("dataset_hash", dataset_hash)
         mlflow.set_tag("data_path", str(filepath))
+        mlflow.set_tag("source_file", source_file)
         mlflow.set_tag("quarantined", str(not success))
 
-        # Artifacts
         mlflow.log_artifact(summary["report_path"], artifact_path="data_validation")
         mlflow.log_artifact(str(schema_file), artifact_path="data_validation")
 
-        # Log the dataset hash as a param for easy comparison across runs
-        mlflow.log_param("dataset_hash", dataset_hash[:16])  # first 16 chars as param
+        mlflow.log_param("dataset_hash", dataset_hash[:16])
         mlflow.log_param("dataset_rows", summary["row_count"])
+        mlflow.log_param("source_file", str(source_file))
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -523,19 +547,20 @@ def validate_and_log_to_mlflow(
 
 
 # ---------------------------------------------------------------------------
-# CLI entrypoint: scrape + validate + route (+ optional MLflow logging)
+# CLI
 # ---------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Scrape housing data, validate, and route via quarantine workflow."
+        description="Validate cleaned housing data and route via quarantine workflow."
     )
-    parser.add_argument("--location", type=str, default="Cincinnati, OH",
-                        help="Location string for HomeHarvest scrape")
-    parser.add_argument("--listing_type", type=str, default="sold",
-                        help="Listing type: sold, for_sale, for_rent")
-    parser.add_argument("--past_days", type=int, default=365,
-                        help="Number of past days to scrape")
+
+    # Input source
+    parser.add_argument("--file", type=str, default=None,
+                        help="Path to a specific cleaned parquet file. "
+                             "If not provided, uses the most recent file in data/cleaned/")
+
+    # MLflow
     parser.add_argument("--mlflow", action="store_true",
                         help="Log results to MLflow")
     parser.add_argument("--experiment", type=str, default="housing_data_validation",
@@ -543,26 +568,46 @@ def main():
     parser.add_argument("--strict", action="store_true",
                         help="Raise error on validation failure")
 
+    # Review mode
+    parser.add_argument("--review", action="store_true",
+                        help="List quarantined files and their failure reasons")
+    parser.add_argument("--approve", type=str, default=None,
+                        help="Approve a quarantined file (move to data/raw/)")
+    parser.add_argument("--reject", type=str, default=None,
+                        help="Reject a quarantined file (move to data/archive/)")
+
     args = parser.parse_args()
 
-    # --- Scrape ---
-    try:
-        from homeharvest import scrape_property
-    except ImportError:
-        raise ImportError("homeharvest is required. Install with: pip install homeharvest")
+    # --- Review mode ---
+    if args.review:
+        list_quarantined()
+        return
 
-    logger.info(f"Scraping {args.location} | type={args.listing_type} | past_days={args.past_days}")
-    df = scrape_property(
-        location=args.location,
-        listing_type=args.listing_type,
-        past_days=args.past_days,
-    )
-    logger.info(f"Scraped {df.shape[0]} rows, {df.shape[1]} columns")
+    if args.approve:
+        review_quarantined(args.approve, approve=True)
+        return
+
+    if args.reject:
+        review_quarantined(args.reject, approve=False)
+        return
+
+    # --- Validation mode ---
+    if args.file:
+        source_file = Path(args.file)
+        if not source_file.exists():
+            raise FileNotFoundError(f"File not found: {source_file}")
+    else:
+        source_file = find_latest_cleaned_file()
+
+    logger.info(f"Loading: {source_file}")
+    df = pd.read_parquet(source_file)
+    logger.info(f"Loaded {df.shape[0]} rows, {df.shape[1]} columns from {source_file}")
 
     # --- Validate + Route (+ optional MLflow) ---
     if args.mlflow:
         success, filepath, summary = validate_and_log_to_mlflow(
             df,
+            source_file=str(source_file),
             experiment_name=args.experiment,
             strict=args.strict,
         )
@@ -573,11 +618,16 @@ def main():
         )
 
     print(f"\n{'='*60}")
+    print(f"  Source:    {source_file}")
     print(f"  Result:    {'PASSED' if success else 'FAILED (quarantined)'}")
     print(f"  Data:      {filepath}")
     print(f"  Rows:      {summary['row_count']}")
     print(f"  Hash:      {summary['dataset_hash'][:16]}...")
     print(f"  Report:    {summary.get('report_path', 'N/A')}")
+    if not success:
+        print(f"  Failures:  {summary['failed']}")
+        for f in summary.get("failures", []):
+            print(f"    ❌ {f['expectation']} | {f['kwargs']}")
     print(f"{'='*60}\n")
 
 
