@@ -205,3 +205,28 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# MLflow
+mlruns/
+mlartifacts/
+
+# Great Expectations
+gx/
+great_expectations/uncommitted/
+
+# Validation & cleaning reports
+validation_reports/
+cleaning_reports/
+
+# Data files (tracked by MLflow, not git)
+data/raw/
+data/errors/
+data/archive/
+data/cleaned/
+
+# Keep the directory structure
+!data/.gitkeep
+!data/raw/.gitkeep
+!data/errors/.gitkeep
+!data/archive/.gitkeep
+!data/cleaned/.gitkeep

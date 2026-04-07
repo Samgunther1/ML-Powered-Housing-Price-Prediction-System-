@@ -9,12 +9,12 @@ Workflow (quarantine pattern):
         |
     Validation checks
         |
-        +---> PASS --> data/raw/        (ready for feature engineering)
+        +---> PASS --> data/processed/        (ready for feature engineering)
         +---> FAIL --> data/errors/     (quarantined for manual review)
                             |
                        Manual review
                             |
-                       +---> Approved  --> moved to data/raw/
+                       +---> Approved  --> moved to data/processed/
                        +---> Rejected  --> archived or deleted
 
 Usage:
@@ -65,12 +65,12 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 DATA_DIR = Path("data")
 CLEANED_DIR = DATA_DIR / "cleaned"   # input: output of scrape_and_clean.py
-RAW_DIR = DATA_DIR / "raw"           # validated, ready for modeling
+PROCESSED_DIR = DATA_DIR / "processed"           # validated, ready for modeling
 ERRORS_DIR = DATA_DIR / "errors"     # failed validation, quarantined
 ARCHIVE_DIR = DATA_DIR / "archive"   # rejected after manual review
 REPORT_DIR = Path("validation_reports")
 
-for _dir in [CLEANED_DIR, RAW_DIR, ERRORS_DIR, ARCHIVE_DIR, REPORT_DIR]:
+for _dir in [CLEANED_DIR, PROCESSED_DIR, ERRORS_DIR, ARCHIVE_DIR, REPORT_DIR]:
     _dir.mkdir(parents=True, exist_ok=True)
 
 
@@ -133,17 +133,18 @@ RANGE_EXPECTATIONS = {
 CATEGORICAL_EXPECTATIONS = {
     "style": (
         [
-            "SINGLE_FAMILY",
-            "CONDO",
-            "CONDOS",
-            "TOWNHOMES",
-            "MULTI_FAMILY",
+         "SINGLE_FAMILY",
+         "CONDO",
+         "CONDOS",
+         "TOWNHOMES",
+         "MULTI_FAMILY",
+         "APARTMENT",
         ],
         0.98,
     ),
     "status": (
         ["SOLD"],
-        0.99,
+        1.0,
     ),
 }
 
@@ -155,16 +156,16 @@ MIN_ROW_COUNT = 50  # cleaned data should have a reasonable number of rows
 # ---------------------------------------------------------------------------
 
 def find_latest_cleaned_file(directory: Path = CLEANED_DIR) -> Path:
-    """Find the most recently created parquet file in the cleaned directory."""
-    parquet_files = sorted(directory.glob("*.parquet"), key=lambda f: f.stat().st_mtime)
+    """Find the most recently created CSV file in the cleaned directory."""
+    csv_files = sorted(directory.glob("*.csv"), key=lambda f: f.stat().st_mtime)
 
-    if not parquet_files:
+    if not csv_files:
         raise FileNotFoundError(
-            f"No parquet files found in {directory}. "
+            f"No CSV files found in {directory}. "
             f"Run scrape_and_clean.py first."
         )
 
-    latest = parquet_files[-1]
+    latest = csv_files[-1]
     logger.info(f"Found latest cleaned file: {latest}")
     return latest
 
@@ -195,7 +196,7 @@ def build_schema_snapshot(df: pd.DataFrame) -> dict:
 # ---------------------------------------------------------------------------
 
 def build_expectation_suite(
-    context: gx.DataContext,
+    context: gx.data_context,
     suite_name: str = "housing_cleaned_suite",
 ) -> gx.ExpectationSuite:
     """Build and return the Expectation Suite for cleaned housing data."""
@@ -259,7 +260,7 @@ def build_expectation_suite(
 def run_validation(
     df: pd.DataFrame,
     suite_name: str = "housing_cleaned_suite",
-    context: Optional[gx.DataContext] = None,
+    context: Optional[gx.data_context] = None,
 ) -> Tuple[bool, object, dict]:
     """Run Great Expectations validation on a cleaned housing DataFrame."""
     if context is None:
@@ -333,11 +334,11 @@ def run_validation(
 # Quarantine workflow
 # ---------------------------------------------------------------------------
 
-def _save_parquet(df: pd.DataFrame, directory: Path, label: str) -> Path:
-    """Save a DataFrame as a timestamped parquet file."""
+def _save_csv(df: pd.DataFrame, directory: Path, label: str) -> Path:
+    """Save a DataFrame as a timestamped CSV file."""
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filepath = directory / f"{label}_{ts}.parquet"
-    df.to_parquet(filepath, index=False)
+    filepath = directory / f"{label}_{ts}.csv"
+    df.to_csv(filepath, index=False)
     logger.info(f"Saved {len(df)} rows to {filepath}")
     return filepath
 
@@ -358,9 +359,9 @@ def validate_and_route(
     label: str = "listings",
 ) -> Tuple[bool, Path, dict]:
     """
-    Validate a cleaned DataFrame and route to raw/ or errors/.
+    Validate a cleaned DataFrame and route to processed/ or errors/.
 
-    Pass -> data/raw/
+    Pass -> data/processed/
     Fail -> data/errors/ (quarantined)
     """
     logger.info(f"Validating cleaned data: {len(df)} rows, {len(df.columns)} columns")
@@ -370,13 +371,13 @@ def validate_and_route(
     summary["report_path"] = str(report_path)
 
     if success:
-        filepath = _save_parquet(df, RAW_DIR, label)
+        filepath = _save_csv(df, PROCESSED_DIR, label)
         logger.info(
             f"✅ PASSED — {summary['passed']}/{summary['evaluated']} expectations met. "
             f"Data saved to {filepath}"
         )
     else:
-        filepath = _save_parquet(df, ERRORS_DIR, label)
+        filepath = _save_csv(df, ERRORS_DIR, label)
         msg = (
             f"❌ FAILED — {summary['failed']}/{summary['evaluated']} expectations failed. "
             f"Data quarantined to {filepath}\n"
@@ -398,14 +399,14 @@ def review_quarantined(
     quarantined_path: str,
     approve: bool = True,
 ) -> Path:
-    """Manual review: approve (move to raw/) or reject (move to archive/)."""
+    """Manual review: approve (move to processed/) or reject (move to archive/)."""
     src = Path(quarantined_path)
     if not src.exists():
         raise FileNotFoundError(f"Quarantined file not found: {src}")
 
     if approve:
-        dest = RAW_DIR / src.name
-        action = "APPROVED → moved to data/raw/"
+        dest = PROCESSED_DIR / src.name
+        action = "APPROVED → moved to data/processed/"
     else:
         dest = ARCHIVE_DIR / src.name
         action = "REJECTED → archived to data/archive/"
@@ -417,7 +418,7 @@ def review_quarantined(
 
 def list_quarantined() -> list:
     """List all files currently in the errors/ quarantine directory."""
-    files = sorted(ERRORS_DIR.glob("*.parquet"), key=lambda f: f.stat().st_mtime)
+    files = sorted(ERRORS_DIR.glob("*.csv"), key=lambda f: f.stat().st_mtime)
     if not files:
         print("\nNo quarantined files found in data/errors/\n")
         return files
@@ -572,7 +573,7 @@ def main():
     parser.add_argument("--review", action="store_true",
                         help="List quarantined files and their failure reasons")
     parser.add_argument("--approve", type=str, default=None,
-                        help="Approve a quarantined file (move to data/raw/)")
+                        help="Approve a quarantined file (move to data/processed/)")
     parser.add_argument("--reject", type=str, default=None,
                         help="Reject a quarantined file (move to data/archive/)")
 
@@ -600,7 +601,7 @@ def main():
         source_file = find_latest_cleaned_file()
 
     logger.info(f"Loading: {source_file}")
-    df = pd.read_parquet(source_file)
+    df = pd.read_csv(source_file)
     logger.info(f"Loaded {df.shape[0]} rows, {df.shape[1]} columns from {source_file}")
 
     # --- Validate + Route (+ optional MLflow) ---
