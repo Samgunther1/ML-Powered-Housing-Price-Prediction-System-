@@ -16,6 +16,7 @@ Workflow (quarantine pattern):
                             |
                        +---> Approved  --> moved to data/processed/
                        +---> Rejected  --> archived or deleted
+                       +---> Fixed     --> remove bad rows, re-validate, move to data/processed/
 
 Usage:
     # Validate the most recent cleaned file (default):
@@ -28,6 +29,10 @@ Usage:
     python scripts/Data_validation.py --review
     python scripts/Data_validation.py --approve data/errors/listings_20260406_150000.parquet --reason "Minor nulls in lot_sqft, acceptable for modeling"
     python scripts/Data_validation.py --reject data/errors/listings_20260406_150000.parquet --reason "Sold_price distribution too skewed, re-scrape needed"
+
+    # Fix quarantined files (remove bad rows, re-validate, approve):
+    python scripts/Data_validation.py --fix data/errors/listings_20260406_150000.csv --filter 'beds>20' --reason "Removed 70-bed outlier"
+    python scripts/Data_validation.py --fix data/errors/listings_20260406_150000.csv --filter 'beds>20' --filter 'sold_price<10000' --reason "Multiple outlier fixes"
 """
 
 import hashlib
@@ -593,6 +598,308 @@ def review_quarantined(
     return dest
 
 
+def parse_filter_rule(rule: str) -> Tuple[str, str, float]:
+    """
+    Parse a filter rule string like 'beds>20' or 'sold_price<=10000'.
+
+    Supported operators: >, >=, <, <=, ==, !=
+    Returns (column, operator, value).
+    """
+    import re
+
+    match = re.match(
+        r"^([a-zA-Z_][a-zA-Z0-9_]*)\s*(>=|<=|!=|==|>|<)\s*(.+)$", rule.strip()
+    )
+    if not match:
+        raise ValueError(
+            f"Invalid filter rule: '{rule}'. "
+            f"Expected format: 'column>value' (e.g., 'beds>20', 'sold_price<=10000')"
+        )
+
+    col, op, val_str = match.groups()
+
+    # Try numeric first, fall back to string
+    try:
+        value = float(val_str)
+    except ValueError:
+        value = val_str.strip("'\"")
+
+    return col, op, value
+
+
+def apply_filter_rules(
+    df: pd.DataFrame,
+    rules: list,
+) -> Tuple[pd.DataFrame, pd.DataFrame, list]:
+    """
+    Apply filter rules to a DataFrame, removing rows that match ANY rule.
+
+    Returns:
+        - cleaned DataFrame (rows that don't match any rule)
+        - removed DataFrame (rows that matched at least one rule)
+        - list of dicts describing each removal action
+    """
+    ops = {
+        ">":  lambda s, v: s > v,
+        ">=": lambda s, v: s >= v,
+        "<":  lambda s, v: s < v,
+        "<=": lambda s, v: s <= v,
+        "==": lambda s, v: s == v,
+        "!=": lambda s, v: s != v,
+    }
+
+    all_mask = pd.Series(False, index=df.index)
+    removal_log = []
+
+    for rule_str in rules:
+        col, op, value = parse_filter_rule(rule_str)
+
+        if col not in df.columns:
+            raise ValueError(f"Column '{col}' not found. Available: {list(df.columns)}")
+
+        mask = ops[op](df[col], value)
+        n_matched = mask.sum()
+
+        removal_log.append({
+            "rule": rule_str,
+            "column": col,
+            "operator": op,
+            "value": value,
+            "rows_removed": int(n_matched),
+        })
+
+        if n_matched > 0:
+            matched_vals = df.loc[mask, col].tolist()
+            # Cap the preview at 10 values to keep logs readable
+            removal_log[-1]["sample_values"] = matched_vals[:10]
+            logger.info(f"  Filter '{rule_str}' matched {n_matched} row(s)")
+        else:
+            logger.info(f"  Filter '{rule_str}' matched 0 rows (no-op)")
+
+        all_mask = all_mask | mask
+
+    removed_df = df[all_mask].copy()
+    cleaned_df = df[~all_mask].copy()
+
+    return cleaned_df, removed_df, removal_log
+
+
+def fix_and_approve(
+    quarantined_path: str,
+    filter_rules: list,
+    reason: str = "",
+    reviewer: str = "",
+    revalidate: bool = True,
+    log_to_mlflow: bool = True,
+) -> Path:
+    """
+    Fix a quarantined file by removing rows that match filter rules,
+    then approve it into data/processed/.
+
+    Optionally re-runs validation to confirm the fix resolves all failures.
+    Logs the full edit history (rules applied, rows removed) to both
+    JSON and MLflow for audit.
+
+    Args:
+        quarantined_path: Path to the quarantined CSV in data/errors/
+        filter_rules: List of filter strings, e.g. ['beds>20', 'sold_price<10000']
+        reason: Human explanation for the fix
+        reviewer: Who performed the review
+        revalidate: If True, re-run Great Expectations after filtering
+        log_to_mlflow: If True, log the fix to MLflow
+    """
+    src = Path(quarantined_path)
+    if not src.exists():
+        raise FileNotFoundError(f"Quarantined file not found: {src}")
+
+    if not filter_rules:
+        raise ValueError("No filter rules provided. Use --fix 'column>value'")
+
+    # Default reviewer
+    if not reviewer:
+        try:
+            reviewer = getpass.getuser()
+        except Exception:
+            reviewer = "unknown"
+
+    if not reason:
+        reason = f"Fix applied: removed rows matching {filter_rules}"
+
+    logger.info(f"Loading quarantined file: {src}")
+    df = pd.read_csv(src)
+    original_count = len(df)
+    logger.info(f"  {original_count} rows, {len(df.columns)} columns")
+
+    # --- Apply filters ---
+    logger.info(f"Applying {len(filter_rules)} filter rule(s):")
+    cleaned_df, removed_df, removal_log = apply_filter_rules(df, filter_rules)
+    total_removed = len(removed_df)
+    logger.info(
+        f"  Removed {total_removed} row(s): {original_count} → {len(cleaned_df)}"
+    )
+
+    if total_removed == 0:
+        logger.warning("No rows matched the filter rules — nothing was removed.")
+
+    if len(cleaned_df) == 0:
+        raise ValueError(
+            "All rows were removed by the filter rules. "
+            "Check your filters — this would produce an empty dataset."
+        )
+
+    # --- Optionally re-validate ---
+    revalidation_result = None
+    if revalidate:
+        logger.info("Re-validating filtered data...")
+        success, _, revalidation_summary = run_validation(cleaned_df)
+        revalidation_result = {
+            "success": success,
+            "evaluated": revalidation_summary["evaluated"],
+            "passed": revalidation_summary["passed"],
+            "failed": revalidation_summary["failed"],
+            "failures": revalidation_summary.get("failures", []),
+        }
+
+        if success:
+            logger.info(
+                f"  ✅ Re-validation PASSED — "
+                f"{revalidation_summary['passed']}/{revalidation_summary['evaluated']}"
+            )
+        else:
+            logger.warning(
+                f"  ⚠️  Re-validation still has {revalidation_summary['failed']} failure(s). "
+                f"Proceeding with approve anyway (review the report)."
+            )
+            for fail in revalidation_summary.get("failures", []):
+                logger.warning(f"    ❌ {fail['expectation']} | {fail['kwargs']}")
+
+    # --- Save fixed file to processed/ ---
+    dest = _save_csv(cleaned_df, PROCESSED_DIR, f"fixed_{src.stem}")
+
+    # --- Save removed rows for audit ---
+    if total_removed > 0:
+        removed_path = _save_csv(removed_df, ARCHIVE_DIR, f"removed_{src.stem}")
+        logger.info(f"  Removed rows archived to {removed_path}")
+    else:
+        removed_path = None
+
+    # --- Look up original validation report ---
+    original_report = _find_matching_validation_report(src)
+
+    # --- Save review report (JSON) ---
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    review_report = {
+        "review_timestamp": datetime.now().isoformat(),
+        "decision": "fix_and_approve",
+        "reason": reason,
+        "reviewer": reviewer,
+        "quarantined_file": str(src),
+        "destination_file": str(dest),
+        "fix_details": {
+            "filter_rules": filter_rules,
+            "removal_log": removal_log,
+            "rows_before": original_count,
+            "rows_after": len(cleaned_df),
+            "rows_removed": total_removed,
+            "removed_rows_archive": str(removed_path) if removed_path else None,
+            "new_dataset_hash": compute_dataset_hash(cleaned_df),
+        },
+    }
+
+    if revalidation_result:
+        review_report["revalidation"] = revalidation_result
+
+    if original_report:
+        review_report["original_validation"] = {
+            "timestamp": original_report.get("timestamp"),
+            "evaluated": original_report.get("evaluated"),
+            "passed": original_report.get("passed"),
+            "failed": original_report.get("failed"),
+            "failures": original_report.get("failures", []),
+            "dataset_hash": original_report.get("dataset_hash"),
+            "row_count": original_report.get("row_count"),
+        }
+
+    report_file = REPORT_DIR / f"review_fix_and_approve_{ts}.json"
+    with open(report_file, "w") as f:
+        json.dump(review_report, f, indent=2, default=str)
+    logger.info(f"  Review report saved to {report_file}")
+
+    # --- Log to MLflow ---
+    if log_to_mlflow:
+        try:
+            import mlflow
+        except ImportError:
+            logger.warning("mlflow not installed — review logged to JSON only.")
+            mlflow = None
+
+        if mlflow:
+            mlflow.set_experiment(REVIEW_EXPERIMENT_NAME)
+            run_name = f"review_fix_{src.stem}_{ts}"
+
+            with mlflow.start_run(run_name=run_name):
+                mlflow.set_tag("review_decision", "fix_and_approve")
+                mlflow.set_tag("review_reason", reason)
+                mlflow.set_tag("reviewer", reviewer)
+                mlflow.set_tag("quarantined_file", str(src))
+                mlflow.set_tag("destination_file", str(dest))
+                mlflow.set_tag("filter_rules", json.dumps(filter_rules))
+
+                mlflow.log_metrics({
+                    "fix_rows_before": original_count,
+                    "fix_rows_after": len(cleaned_df),
+                    "fix_rows_removed": total_removed,
+                    "fix_rules_applied": len(filter_rules),
+                })
+
+                new_hash = compute_dataset_hash(cleaned_df)
+                mlflow.set_tag("dataset_hash", new_hash)
+                mlflow.log_param("dataset_hash", new_hash[:16])
+                mlflow.log_param("dataset_rows", len(cleaned_df))
+
+                if revalidation_result:
+                    mlflow.log_metrics({
+                        "dq_revalidation_passed": int(revalidation_result["success"]),
+                        "dq_revalidation_expectations_passed": revalidation_result["passed"],
+                        "dq_revalidation_expectations_failed": revalidation_result["failed"],
+                    })
+
+                if original_report:
+                    mlflow.log_metrics({
+                        "dq_original_expectations_failed": original_report.get("failed", 0),
+                    })
+
+                mlflow.log_artifact(str(report_file), artifact_path="quarantine_reviews")
+                if removed_path:
+                    mlflow.log_artifact(str(removed_path), artifact_path="quarantine_reviews")
+
+            logger.info(f"  Fix decision logged to MLflow experiment '{REVIEW_EXPERIMENT_NAME}'")
+
+    # --- Remove original quarantined file ---
+    src.unlink()
+    logger.info(f"  Removed original quarantined file: {src}")
+
+    # --- Summary ---
+    print(f"\n{'='*60}")
+    print(f"  FIX & APPROVE")
+    print(f"{'='*60}")
+    print(f"  Source:         {src}")
+    print(f"  Filters:        {filter_rules}")
+    print(f"  Rows removed:   {total_removed} ({original_count} → {len(cleaned_df)})")
+    if removed_path:
+        print(f"  Removed saved:  {removed_path}")
+    print(f"  Output:         {dest}")
+    if revalidation_result:
+        status = "✅ PASSED" if revalidation_result["success"] else "⚠️  STILL HAS FAILURES"
+        print(f"  Re-validation:  {status}")
+    print(f"  Report:         {report_file}")
+    print(f"  Reviewer:       {reviewer}")
+    print(f"  Reason:         {reason}")
+    print(f"{'='*60}\n")
+
+    return dest
+
+
 def list_quarantined() -> list:
     """List all files currently in the errors/ quarantine directory."""
     files = sorted(ERRORS_DIR.glob("*.csv"), key=lambda f: f.stat().st_mtime)
@@ -634,6 +941,7 @@ def list_quarantined() -> list:
     print(f"\n{'='*60}")
     print(f"  To approve:  python scripts/Data_validation.py --approve <filepath> --reason \"...\"")
     print(f"  To reject:   python scripts/Data_validation.py --reject <filepath> --reason \"...\"")
+    print(f"  To fix:      python scripts/Data_validation.py --fix <filepath> --filter 'beds>20' --reason \"...\"")
     print(f"  Add --reviewer <name> to tag who reviewed (defaults to OS user)")
     print(f"  Add --no-mlflow to skip MLflow logging")
     print(f"{'='*60}\n")
@@ -755,6 +1063,14 @@ def main():
                         help="Approve a quarantined file (move to data/processed/)")
     parser.add_argument("--reject", type=str, default=None,
                         help="Reject a quarantined file (move to data/archive/)")
+    parser.add_argument("--fix", type=str, default=None,
+                        help="Fix a quarantined file by removing rows, then approve. "
+                             "Provide the filepath, and use --filter for rules.")
+    parser.add_argument("--filter", type=str, action="append", default=[],
+                        help="Filter rule for --fix: 'column>value'. Can be repeated. "
+                             "Examples: --filter 'beds>20' --filter 'sold_price<10000'")
+    parser.add_argument("--no-revalidate", action="store_true",
+                        help="Skip re-validation after --fix (not recommended)")
     parser.add_argument("--reason", type=str, default="",
                         help="Reason for approve/reject decision (logged to MLflow)")
     parser.add_argument("--reviewer", type=str, default="",
@@ -785,6 +1101,19 @@ def main():
             approve=False,
             reason=args.reason,
             reviewer=args.reviewer,
+            log_to_mlflow=not args.no_mlflow,
+        )
+        return
+
+    if args.fix:
+        if not args.filter:
+            parser.error("--fix requires at least one --filter rule (e.g., --filter 'beds>20')")
+        fix_and_approve(
+            quarantined_path=args.fix,
+            filter_rules=args.filter,
+            reason=args.reason,
+            reviewer=args.reviewer,
+            revalidate=not args.no_revalidate,
             log_to_mlflow=not args.no_mlflow,
         )
         return
