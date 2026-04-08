@@ -72,7 +72,7 @@ A housing price prediction system will help solve the problem of price volatilit
 
 ### Business Metrics
 
-- **Listing Price Accuracy Rate** — Measures how often predicted prices are close to final sale prices, showing how useful the system is for buyers and sellers.
+- **Sold Price Accuracy Rate** — Measures how often predicted prices are close to final sale prices, showing how useful the system is for buyers and sellers.
 - **Average Time on Market** — Tracks how long properties take to sell, where better pricing should help reduce delays.
 - **Loan Default Rate** — Tracks whether improved valuations help lenders reduce risky loans and defaults.
 - **Revenue Impact** — Will measure increases in sales efficiency or transaction volume from better pricing decisions.
@@ -91,7 +91,7 @@ Data will be ingested using the `scrape_property` function. We can utilize this 
 
 ### Data Validation
 
-Data ingested into the pipeline will be validated based on completeness, accuracy, and schema. Systems will be built into the data pipeline to handle the following:
+Data ingested into the pipeline will be validated based on completeness, accuracy, and schema. All data validation will be handled through the great_expectations python packagse. Systems will be built into the data pipeline to handle the following:
 
 **Completeness:**
 
@@ -113,22 +113,22 @@ Data ingested into the pipeline will be validated based on completeness, accurac
 
 ### Data Versioning
 
-A data log will be utilized to keep track of all datasets. The data log will specify metadata for both raw and processed data. Raw metadata will contain details like date pulled, function-specific options like location, who pulled the data, and record count. Processed metadata will include details about the specific transformations performed to convert raw data into usable training sets.
+Mlflow will be used for data versioning. Data will be tracked from the scraping phase all the way to the point at which it enters the model. The mlflow ui will record exactly what is done to the data through the different steps, for example during data validation mlflow will report the number of validations passed and failed and what the data failed on.
 
 ### Data Pipeline Architecture
 
 1. **Raw data is ingested** via `scrape_property` function
-   - Metadata recorded in log
-2. **Data validation** procedures are performed on raw data automatically when it is ingested via a raw data ingestion Python script
+   - Metadata recorded in mlflow
+2. **Data validation** procedures are performed on raw data via great_expectations when raw data is called into the validation script
    - Data that fails validation checks is moved to an error location for manual review
    - Data that fails manual review is archived or deleted
-   - Data that passes review can reenter the raw data with the rest of the pull
-   - Data log is updated with pass and fail details
+   - Data that passes review can reenter the pipeline
+   - Mlflow tracks pass and fail details along with manual review decisions
 
 ![Raw Data Pipeline](docs/images/data_pipeline_raw.png)
 
 3. **Processed data** starts from validated and cleaned raw data
-   - Processed data flows through model development and may change with things like feature engineering and training/test splits
+   - Processed data is used to perform feature engineering and model training
 
 ![Processed Data Pipeline](docs/images/data_pipeline_processed.png)
 
