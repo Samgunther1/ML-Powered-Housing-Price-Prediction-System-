@@ -336,6 +336,7 @@ def log_cleaning_to_mlflow(
         mlflow.log_artifact(str(report_file), artifact_path="data_cleaning")
         mlflow.log_artifact(cleaned_file, artifact_path="data_cleaning")
 
+    mlflow.set_tracking_uri("sqlite:///mlflow.db")
     if run_id:
         with mlflow.start_run(run_id=run_id):
             _log()

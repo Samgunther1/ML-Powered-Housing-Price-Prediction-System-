@@ -487,6 +487,7 @@ def _log_review_to_mlflow(
         )
         return
 
+    mlflow.set_tracking_uri("sqlite:///mlflow.db")
     mlflow.set_experiment(experiment_name)
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -834,6 +835,7 @@ def fix_and_approve(
             mlflow = None
 
         if mlflow:
+            mlflow.set_tracking_uri("sqlite:///mlflow.db")
             mlflow.set_experiment(REVIEW_EXPERIMENT_NAME)
             run_name = f"review_fix_{src.stem}_{ts}"
 
@@ -1015,6 +1017,7 @@ def validate_and_log_to_mlflow(
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 
+    mlflow.set_tracking_uri("sqlite:///mlflow.db")
     if run_id:
         with mlflow.start_run(run_id=run_id):
             _log()
