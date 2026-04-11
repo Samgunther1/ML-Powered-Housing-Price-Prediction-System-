@@ -704,7 +704,7 @@ def fix_and_approve(
     Args:
         quarantined_path: Path to the quarantined CSV in data/errors/
         filter_rules: List of filter strings, e.g. ['beds>20', 'sold_price<10000']
-        reason: Human explanation for the fix
+        reason: Explanation for the fix
         reviewer: Who performed the review
         revalidate: If True, re-run Great Expectations after filtering
         log_to_mlflow: If True, log the fix to MLflow
