@@ -130,7 +130,7 @@ Mlflow will be used for data versioning. Data will be tracked from the scraping 
 3. **Processed data** starts from validated and cleaned raw data
    - Processed data is used to perform feature engineering and model training
 
-![Processed Data Pipeline](docs/images/data_pipeline_processed.png)
+![Processed Data Pipeline](docs/images/pipeline.png)
 
 ---
 
