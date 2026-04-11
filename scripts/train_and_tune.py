@@ -25,7 +25,15 @@ import optuna
 import pandas as pd
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.model_selection import cross_val_score
+from sklearn.metrics import make_scorer, r2_score, mean_squared_error
 from mlflow.models.signature import infer_signature
+
+
+def adjusted_r2(y_true, y_pred, n_features):
+    """Compute adjusted R² given the number of features."""
+    n = len(y_true)
+    r2 = r2_score(y_true, y_pred)
+    return 1 - (1 - r2) * (n - 1) / (n - n_features - 1)
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 
@@ -68,8 +76,16 @@ def load_data(path: str):
 
 
 # ── Optuna Objective ─────────────────────────────────────────────────────
-def create_objective(X, y, cv_folds, seed):
-    """Return an Optuna objective function that logs each trial to MLflow."""
+def create_objective(X, y, cv_folds, seed, n_features):
+    """Return an Optuna objective function that logs each trial to MLflow.
+    
+    Optimises adjusted R² (maximise) to penalise complexity from the
+    large number of one-hot encoded features.
+    """
+    # Custom scorer: adjusted R² needs n_features, so we bake it in
+    adj_r2_scorer = make_scorer(
+        adjusted_r2, greater_is_better=True, n_features=n_features
+    )
 
     def objective(trial: optuna.Trial) -> float:
         params = {
@@ -85,18 +101,23 @@ def create_objective(X, y, cv_folds, seed):
 
         rf = RandomForestRegressor(**params)
 
-        # 5-fold CV with negative RMSE (sklearn convention)
+        # 5-fold CV with adjusted R² as the primary tuning metric
+        adj_r2_scores = cross_val_score(
+            rf, X, y,
+            cv=cv_folds,
+            scoring=adj_r2_scorer,
+            n_jobs=-1,
+        )
+        mean_adj_r2 = adj_r2_scores.mean()
+        std_adj_r2  = adj_r2_scores.std()
+
+        # Also compute RMSE, MAE, and standard R² for richer tracking
         neg_rmse_scores = cross_val_score(
             rf, X, y,
             cv=cv_folds,
             scoring="neg_root_mean_squared_error",
             n_jobs=-1,
         )
-
-        mean_rmse = -neg_rmse_scores.mean()
-        std_rmse  = neg_rmse_scores.std()
-
-        # Also compute MAE & R² for richer tracking
         mae_scores = cross_val_score(
             rf, X, y,
             cv=cv_folds,
@@ -110,30 +131,35 @@ def create_objective(X, y, cv_folds, seed):
             n_jobs=-1,
         )
 
-        mean_mae = -mae_scores.mean()
-        mean_r2  = r2_scores.mean()
+        mean_rmse = -neg_rmse_scores.mean()
+        std_rmse  = neg_rmse_scores.std()
+        mean_mae  = -mae_scores.mean()
+        mean_r2   = r2_scores.mean()
 
         # ── Log trial to MLflow ──
         with mlflow.start_run(nested=True, run_name=f"trial_{trial.number}"):
             mlflow.log_params(params)
             mlflow.log_metrics({
-                "cv_rmse_mean": round(mean_rmse, 2),
-                "cv_rmse_std":  round(std_rmse, 2),
-                "cv_mae_mean":  round(mean_mae, 2),
-                "cv_r2_mean":   round(mean_r2, 4),
+                "cv_adj_r2_mean": round(mean_adj_r2, 4),
+                "cv_adj_r2_std":  round(std_adj_r2, 4),
+                "cv_r2_mean":     round(mean_r2, 4),
+                "cv_rmse_mean":   round(mean_rmse, 2),
+                "cv_rmse_std":    round(std_rmse, 2),
+                "cv_mae_mean":    round(mean_mae, 2),
             })
             mlflow.set_tag("trial_number", trial.number)
 
-        print(f"  Trial {trial.number:>3d}  |  RMSE: ${mean_rmse:>10,.2f}  "
-              f"(±${std_rmse:>8,.2f})  |  R²: {mean_r2:.4f}")
+        print(f"  Trial {trial.number:>3d}  |  Adj R²: {mean_adj_r2:.4f}  "
+              f"(±{std_adj_r2:.4f})  |  RMSE: ${mean_rmse:>10,.2f}  |  R²: {mean_r2:.4f}")
 
-        return mean_rmse   # Optuna minimises by default
+        return mean_adj_r2   # Optuna maximises this
 
     return objective
 
 
 # ── Final Model Training ─────────────────────────────────────────────────
-def train_final_model(X, y, best_params, feature_names, model_output, seed):
+def train_final_model(X, y, best_params, feature_names, model_output, seed,
+                      best_trial_metrics):
     """Retrain on full dataset with best hyperparameters and log to MLflow."""
     print("\n" + "=" * 65)
     print("RETRAINING FINAL MODEL ON FULL DATASET")
@@ -158,15 +184,19 @@ def train_final_model(X, y, best_params, feature_names, model_output, seed):
         train_preds = final_rf.predict(X)
         train_rmse = np.sqrt(np.mean((y - train_preds) ** 2))
         train_mae  = np.mean(np.abs(y - train_preds))
-        ss_res = np.sum((y - train_preds) ** 2)
-        ss_tot = np.sum((y - y.mean()) ** 2)
-        train_r2 = 1 - ss_res / ss_tot
+        n_features = X.shape[1] if hasattr(X, 'shape') else len(feature_names)
+        train_r2     = r2_score(y, train_preds)
+        train_adj_r2 = adjusted_r2(y, train_preds, n_features)
 
         mlflow.log_metrics({
-            "train_rmse": round(train_rmse, 2),
-            "train_mae":  round(train_mae, 2),
-            "train_r2":   round(train_r2, 4),
+            "train_rmse":   round(train_rmse, 2),
+            "train_mae":    round(train_mae, 2),
+            "train_r2":     round(train_r2, 4),
+            "train_adj_r2": round(train_adj_r2, 4),
         })
+
+        # Carry forward the best trial's CV metrics for easy reference
+        mlflow.log_metrics(best_trial_metrics)
 
         # Log the model with signature and feature list
         mlflow.sklearn.log_model(
@@ -215,9 +245,10 @@ def train_final_model(X, y, best_params, feature_names, model_output, seed):
     print(f"MLflow run ID:        {final_run_id}")
 
     print(f"\nIn-sample metrics (sanity check):")
-    print(f"  RMSE:  ${train_rmse:>10,.2f}")
-    print(f"  MAE:   ${train_mae:>10,.2f}")
-    print(f"  R²:    {train_r2:.4f}")
+    print(f"  RMSE:    ${train_rmse:>10,.2f}")
+    print(f"  MAE:     ${train_mae:>10,.2f}")
+    print(f"  R²:      {train_r2:.4f}")
+    print(f"  Adj R²:  {train_adj_r2:.4f}")
 
     print(f"\nTop 10 features by importance:")
     for feat, imp in feat_imp[:10]:
@@ -252,12 +283,12 @@ def main():
 
         optuna.logging.set_verbosity(optuna.logging.WARNING)
         study = optuna.create_study(
-            direction="minimize",
+            direction="maximize",
             sampler=optuna.samplers.TPESampler(seed=args.seed),
             study_name="rf_housing_tuning",
         )
         study.optimize(
-            create_objective(X, y, args.cv_folds, args.seed),
+            create_objective(X, y, args.cv_folds, args.seed, X.shape[1]),
             n_trials=args.n_trials,
             show_progress_bar=True,
         )
@@ -265,20 +296,34 @@ def main():
         # ── Log best trial results to parent run ──
         best = study.best_trial
         mlflow.log_metrics({
-            "best_cv_rmse":   round(best.value, 2),
+            "best_cv_adj_r2": round(best.value, 4),
             "best_trial_num": best.number,
         })
         mlflow.log_params({f"best_{k}": v for k, v in best.params.items()})
 
         print(f"\n{'=' * 65}")
         print(f"BEST TRIAL: #{best.number}")
-        print(f"  CV RMSE:  ${best.value:,.2f}")
-        print(f"  Params:   {json.dumps(best.params, indent=4)}")
+        print(f"  CV Adj R²: {best.value:.4f}")
+        print(f"  Params:    {json.dumps(best.params, indent=4)}")
 
         # ── Train final model ──
+        # Retrieve the best trial's CV metrics from its MLflow run
+        best_trial_run = mlflow.search_runs(
+            filter_string=f"tags.trial_number = '{best.number}'",
+            order_by=["attributes.start_time DESC"],
+            max_results=1,
+        )
+        best_trial_metrics = {}
+        for col in best_trial_run.columns:
+            if col.startswith("metrics.cv_"):
+                metric_name = col.replace("metrics.", "best_")
+                val = best_trial_run[col].iloc[0]
+                if pd.notna(val):
+                    best_trial_metrics[metric_name] = round(val, 4)
+
         final_model, final_run_id = train_final_model(
             X, y, best.params.copy(), feature_names,
-            args.model_output, args.seed,
+            args.model_output, args.seed, best_trial_metrics,
         )
 
         # Log the parent run ID for easy lookup
