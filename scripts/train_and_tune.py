@@ -37,6 +37,147 @@ def adjusted_r2(y_true, y_pred, n_features):
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 
+
+# ── Feature Schema Builder ───────────────────────────────────────────────
+def build_feature_schema(feature_names: list[str]) -> dict:
+    """Auto-detect feature types from column naming conventions.
+
+    Strategy: try progressively longer underscore-delimited prefixes to find
+    groups of 2+ columns that share the same prefix. For example:
+      - city_Cincinnati, city_Madeira  →  group "city" with values
+      - zip_code_45208, zip_code_45209 →  group "zip_code" with values
+      - sale_season_Spring, sale_season_Summer → group "sale_season" with values
+      - sale_month (standalone) → not grouped, classified separately
+    """
+    from collections import defaultdict
+
+    # ── Step 1: Find all candidate prefix groups ──
+    # For each column, generate all possible prefixes by splitting on "_"
+    # e.g. "zip_code_45208" → candidates: "zip", "zip_code"
+    prefix_candidates = defaultdict(set)  # prefix → set of (column, value)
+    for col in feature_names:
+        parts = col.split("_")
+        for i in range(1, len(parts)):
+            prefix = "_".join(parts[:i])
+            value = "_".join(parts[i:])
+            prefix_candidates[prefix].add((col, value))
+
+    # ── Step 2: Pick the LONGEST prefix that has 2+ members ──
+    # Sort by prefix length descending so longer prefixes win
+    assigned = set()
+    categorical_groups = {}  # prefix → sorted list of values
+    categorical_columns = {}  # prefix → list of column names
+
+    for prefix in sorted(prefix_candidates.keys(), key=len, reverse=True):
+        members = prefix_candidates[prefix]
+        # Only form a group if 2+ columns AND none already assigned
+        unassigned = [(col, val) for col, val in members if col not in assigned]
+        if len(unassigned) >= 2:
+            categorical_groups[prefix] = sorted([val for _, val in unassigned])
+            categorical_columns[prefix] = sorted([col for col, _ in unassigned])
+            for col, _ in unassigned:
+                assigned.add(col)
+
+    # ── Step 3: Classify remaining columns ──
+    remaining = [col for col in feature_names if col not in assigned]
+
+    # Known binary patterns (0/1 flags)
+    binary_features = []
+    numeric_features = []
+    for col in remaining:
+        # Heuristics for binary: starts with "has_", "is_", "new_", or known flags
+        if (col.startswith("has_") or col.startswith("is_") or
+                col in ("new_construction",)):
+            binary_features.append(col)
+        else:
+            numeric_features.append(col)
+
+    # ── Also rescue has_* columns that got grouped categorically ──
+    # e.g. has_garage + has_hoa form a "has" group, but they're really
+    # independent binary flags that should be auto-derived
+    rescue_prefixes = []
+    for prefix, values in list(categorical_groups.items()):
+        cols_in_group = categorical_columns[prefix]
+        if all(c.startswith("has_") or c.startswith("is_") for c in cols_in_group):
+            # These are binary flags, not a real categorical
+            binary_features.extend(cols_in_group)
+            for c in cols_in_group:
+                assigned.discard(c)
+            rescue_prefixes.append(prefix)
+    for p in rescue_prefixes:
+        del categorical_groups[p]
+        del categorical_columns[p]
+
+    # ── Step 4: Detect auto-derived features ──
+    auto_derived = {}
+
+    # has_X flags: derive from corresponding numeric feature
+    for col in binary_features:
+        if col.startswith("has_"):
+            target = col[4:]  # e.g. "has_hoa" → "hoa"
+            # Look for a numeric feature containing this word
+            for num_col in numeric_features:
+                if target in num_col:
+                    auto_derived[col] = {
+                        "derived_from": num_col,
+                        "rule": "greater_than_zero",
+                    }
+                    break
+
+    # sale_month: derive from current date
+    if "sale_month" in numeric_features:
+        auto_derived["sale_month"] = {
+            "derived_from": "current_date",
+            "rule": "current_month",
+        }
+
+    # sale_season group: derive from current date
+    if "sale_season" in categorical_groups:
+        auto_derived["sale_season"] = {
+            "derived_from": "current_date",
+            "rule": "current_season",
+        }
+
+    # Split binary into user-input vs auto-derived
+    user_binary = [f for f in binary_features if f not in auto_derived]
+    auto_columns = [col for col in feature_names if col in auto_derived or
+                    any(col in categorical_columns.get(grp, [])
+                        for grp in auto_derived if grp in categorical_groups)]
+
+    # ── Step 5: Build defaults for numeric features ──
+    numeric_defaults = {col: 0 for col in numeric_features}
+    default_overrides = {
+        "beds": 3, "full_baths": 2, "half_baths": 0, "sqft": 1500,
+        "year_built": 1960, "lot_sqft": 8000, "stories": 2, "hoa_fee": 0,
+        "parking_garage": 1, "sale_month": 1,
+    }
+    for col, val in default_overrides.items():
+        if col in numeric_defaults:
+            numeric_defaults[col] = val
+
+    # ── Step 6: Identify user-facing categorical groups ──
+    # (exclude auto-derived groups like sale_season)
+    user_categorical_groups = {
+        k: v for k, v in categorical_groups.items()
+        if k not in auto_derived
+    }
+    auto_categorical_groups = {
+        k: v for k, v in categorical_groups.items()
+        if k in auto_derived
+    }
+
+    schema = {
+        "feature_columns": feature_names,
+        "numeric_features": numeric_features,
+        "binary_features": user_binary,
+        "categorical_groups": user_categorical_groups,
+        "auto_derived": auto_derived,
+        "auto_categorical_groups": auto_categorical_groups,
+        "numeric_defaults": numeric_defaults,
+        "target": "sold_price",
+    }
+    return schema
+
 # ── CLI ──────────────────────────────────────────────────────────────────
 def parse_args():
     parser = argparse.ArgumentParser(description="Train & tune RF housing model")
@@ -213,6 +354,16 @@ def train_final_model(X, y, best_params, feature_names, model_output, seed,
         mlflow.log_artifact(str(feature_path))
         feature_path.unlink()
 
+        # ── Build & log feature schema for dynamic API/UI ──
+        schema = build_feature_schema(feature_names)
+        schema_path = Path("feature_schema.json")
+        schema_path.write_text(json.dumps(schema, indent=2))
+        mlflow.log_artifact(str(schema_path))
+        schema_path.unlink()
+        print(f"  Feature schema logged: {len(schema['numeric_features'])} numeric, "
+              f"{len(schema['categorical_groups'])} categorical groups, "
+              f"{len(schema['binary_features'])} binary")
+
         # Feature importance top 15
         importances = final_rf.feature_importances_
         feat_imp = sorted(zip(feature_names, importances),
@@ -231,14 +382,12 @@ def train_final_model(X, y, best_params, feature_names, model_output, seed,
     output_path.parent.mkdir(parents=True, exist_ok=True)
     joblib.dump(final_rf, output_path)
 
-    # Also save feature names alongside the model
+    # Also save feature schema alongside the model for local use
     meta_path = output_path.with_suffix(".meta.json")
-    meta_path.write_text(json.dumps({
-        "feature_names": feature_names,
-        "n_features": len(feature_names),
-        "training_rows": X.shape[0],
-        "target": "sold_price",
-    }, indent=2))
+    schema = build_feature_schema(feature_names)
+    schema["n_features"] = len(feature_names)
+    schema["training_rows"] = X.shape[0]
+    meta_path.write_text(json.dumps(schema, indent=2))
 
     print(f"\nFinal model saved to: {output_path}")
     print(f"Feature metadata:     {meta_path}")
