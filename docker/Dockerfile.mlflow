@@ -1,0 +1,11 @@
+FROM python:3.12-slim
+
+RUN pip install --no-cache-dir mlflow==2.21.3
+
+# Create the MLflow storage directory
+RUN mkdir -p /mlflow/mlartifacts
+
+# Install curl for healthcheck
+RUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf /var/lib/apt/lists/*
+
+EXPOSE 5000
