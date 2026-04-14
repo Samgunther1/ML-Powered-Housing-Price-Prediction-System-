@@ -125,8 +125,8 @@ NOT_NULL_EXPECTATIONS = {
 
 # Range checks — outliers should already be removed, so these act as a safety net
 RANGE_EXPECTATIONS = {
-    "list_price": (10_000, 100_000_000, 1.0),
-    "sold_price": (10_000, 100_000_000, 1.0),
+    "list_price": (50_000, 100_000_000, 1.0),
+    "sold_price": (50_000, 100_000_000, 1.0),
     "sqft": (100, 50_000, 0.98),
     "beds": (0, 20, 1.0),
     "full_baths": (0, 20, 1.0),
@@ -346,10 +346,34 @@ def run_validation(
 # Quarantine workflow
 # ---------------------------------------------------------------------------
 
-def _save_csv(df: pd.DataFrame, directory: Path, label: str) -> Path:
-    """Save a DataFrame as a timestamped CSV file."""
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filepath = directory / f"{label}_{ts}.csv"
+def _save_csv(df: pd.DataFrame, directory: Path, label: str,
+              source_name: str = "") -> Path:
+    """Save a DataFrame as a CSV, naming it <label>_<source_name>.csv.
+
+    If source_name is provided (e.g. 'Cincinnati_OH_365d_20250414_183022'),
+    the output becomes '<label>_Cincinnati_OH_365d_20250414_183022.csv'.
+    Falls back to a timestamp if no source name is given.
+    """
+    if source_name:
+        # Strip any existing verb prefix (validated_, quarantined_, etc.)
+        # so we don't stack prefixes like 'fixed_quarantined_...'
+        KNOWN_PREFIXES = ("validated_", "quarantined_", "fixed_",
+                          "approved_", "rejected_", "removed_")
+        clean_name = source_name
+        for prefix in KNOWN_PREFIXES:
+            if clean_name.startswith(prefix):
+                clean_name = clean_name[len(prefix):]
+                break
+        filename = f"{label}_{clean_name}"
+    else:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"{label}_{ts}.csv"
+
+    # Ensure .csv extension
+    if not filename.endswith(".csv"):
+        filename += ".csv"
+
+    filepath = directory / filename
     df.to_csv(filepath, index=False)
     logger.info(f"Saved {len(df)} rows to {filepath}")
     return filepath
@@ -369,27 +393,31 @@ def validate_and_route(
     df: pd.DataFrame,
     strict: bool = False,
     label: str = "listings",
+    source_file: str = "",
 ) -> Tuple[bool, Path, dict]:
     """
     Validate a cleaned DataFrame and route to processed/ or errors/.
 
-    Pass -> data/processed/
-    Fail -> data/errors/ (quarantined)
+    Pass -> data/processed/  (prefixed 'validated_')
+    Fail -> data/errors/     (prefixed 'quarantined_')
     """
     logger.info(f"Validating cleaned data: {len(df)} rows, {len(df.columns)} columns")
+
+    # Derive the base name from the source file for readable output names
+    source_name = Path(source_file).stem if source_file else ""
 
     success, results, summary = run_validation(df)
     report_path = _save_report(summary)
     summary["report_path"] = str(report_path)
 
     if success:
-        filepath = _save_csv(df, PROCESSED_DIR, label)
+        filepath = _save_csv(df, PROCESSED_DIR, "validated", source_name)
         logger.info(
             f"✅ PASSED — {summary['passed']}/{summary['evaluated']} expectations met. "
             f"Data saved to {filepath}"
         )
     else:
-        filepath = _save_csv(df, ERRORS_DIR, label)
+        filepath = _save_csv(df, ERRORS_DIR, "quarantined", source_name)
         msg = (
             f"❌ FAILED — {summary['failed']}/{summary['evaluated']} expectations failed. "
             f"Data quarantined to {filepath}\n"
@@ -560,9 +588,9 @@ def review_quarantined(
         reason = f"Manual {decision} — no reason provided"
 
     if approve:
-        dest = PROCESSED_DIR / src.name
+        dest = PROCESSED_DIR / f"approved_{src.stem}.csv"
     else:
-        dest = ARCHIVE_DIR / src.name
+        dest = ARCHIVE_DIR / f"rejected_{src.stem}.csv"
 
     # Look up the original validation report for context
     original_report = _find_matching_validation_report(src)
@@ -775,11 +803,11 @@ def fix_and_approve(
                 logger.warning(f"    ❌ {fail['expectation']} | {fail['kwargs']}")
 
     # --- Save fixed file to processed/ ---
-    dest = _save_csv(cleaned_df, PROCESSED_DIR, f"fixed_{src.stem}")
+    dest = _save_csv(cleaned_df, PROCESSED_DIR, "fixed", src.stem)
 
     # --- Save removed rows for audit ---
     if total_removed > 0:
-        removed_path = _save_csv(removed_df, ARCHIVE_DIR, f"removed_{src.stem}")
+        removed_path = _save_csv(removed_df, ARCHIVE_DIR, "removed", src.stem)
         logger.info(f"  Removed rows archived to {removed_path}")
     else:
         removed_path = None
@@ -979,7 +1007,9 @@ def validate_and_log_to_mlflow(
         raise ImportError("mlflow is required. Install with: pip install mlflow")
 
     # Step 1: validate and route
-    success, filepath, summary = validate_and_route(df, strict=False, label=label)
+    success, filepath, summary = validate_and_route(
+        df, strict=False, label=label, source_file=source_file,
+    )
 
     # Step 2: build versioning artifacts
     dataset_hash = summary["dataset_hash"]
@@ -991,6 +1021,14 @@ def validate_and_log_to_mlflow(
 
     # Step 3: log to MLflow
     def _log():
+        # --- Params: input context ---
+        mlflow.log_param("source_file", str(source_file))
+        mlflow.log_param("output_file", Path(filepath).name)
+        mlflow.log_param("dataset_hash", dataset_hash[:16])
+        mlflow.log_param("dataset_rows", summary["row_count"])
+        mlflow.log_param("validation_result", "passed" if success else "quarantined")
+
+        # --- Metrics: data quality ---
         mlflow.log_metrics(
             {
                 "dq_expectations_total": summary["evaluated"],
@@ -1002,20 +1040,20 @@ def validate_and_log_to_mlflow(
             }
         )
 
+        # --- Tags ---
         mlflow.set_tag("data_validation_passed", str(success))
         mlflow.set_tag("dataset_hash", dataset_hash)
         mlflow.set_tag("data_path", str(filepath))
         mlflow.set_tag("source_file", source_file)
         mlflow.set_tag("quarantined", str(not success))
 
+        # --- Artifacts ---
         mlflow.log_artifact(summary["report_path"], artifact_path="data_validation")
         mlflow.log_artifact(str(schema_file), artifact_path="data_validation")
 
-        mlflow.log_param("dataset_hash", dataset_hash[:16])
-        mlflow.log_param("dataset_rows", summary["row_count"])
-        mlflow.log_param("source_file", str(source_file))
-
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    source_label = Path(source_file).stem if source_file else ts
+    outcome = "passed" if success else "quarantined"
 
     mlflow.set_tracking_uri("sqlite:///mlflow.db")
     if run_id:
@@ -1024,7 +1062,7 @@ def validate_and_log_to_mlflow(
     else:
         if experiment_name:
             mlflow.set_experiment(experiment_name)
-        with mlflow.start_run(run_name=f"data_validation_{ts}"):
+        with mlflow.start_run(run_name=f"validation_{outcome}_{source_label}"):
             _log()
 
     status = "✅ PASSED" if success else "❌ FAILED (quarantined)"
@@ -1145,6 +1183,7 @@ def main():
         success, filepath, summary = validate_and_route(
             df,
             strict=args.strict,
+            source_file=str(source_file),
         )
 
     print(f"\n{'='*60}")
