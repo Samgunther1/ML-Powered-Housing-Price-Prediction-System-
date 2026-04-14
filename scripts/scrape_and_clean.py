@@ -63,6 +63,26 @@ REPORT_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # ---------------------------------------------------------------------------
+# Filename builder
+# ---------------------------------------------------------------------------
+
+def build_output_filename(location: str, past_days: int) -> str:
+    """Build a readable filename: <city_state>_<past_days>d_<YYYYMMDD_HHMMSS>.csv
+
+    Examples:
+        "Cincinnati, OH" / 365  →  Cincinnati_OH_365d_20250414_183022.csv
+        "New York, NY"   / 90   →  New_York_NY_90d_20250414_183022.csv
+    """
+    # Normalize location: strip whitespace, replace commas/spaces with underscores
+    clean_loc = location.strip()
+    clean_loc = clean_loc.replace(",", "")   # "Cincinnati, OH" → "Cincinnati OH"
+    clean_loc = clean_loc.replace(" ", "_")   # "Cincinnati OH"  → "Cincinnati_OH"
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return f"{clean_loc}_{past_days}d_{ts}.csv"
+
+
+# ---------------------------------------------------------------------------
 # Data hashing
 # ---------------------------------------------------------------------------
 
@@ -302,12 +322,20 @@ def log_cleaning_to_mlflow(
         json.dump(cleaning_log, f, indent=2, default=str)
 
     def _log():
-        # --- Params ---
+        # --- Params: scrape context ---
+        scrape = cleaning_log.get("scrape_params", {})
+        if scrape:
+            mlflow.log_param("location", scrape.get("location", ""))
+            mlflow.log_param("listing_type", scrape.get("listing_type", ""))
+            mlflow.log_param("past_days", scrape.get("past_days", ""))
+
+        # --- Params: cleaning config ---
         mlflow.log_param("iqr_multiplier", cleaning_log["iqr_multiplier"])
         mlflow.log_param("raw_hash", cleaning_log["raw_hash"][:16])
         mlflow.log_param("cleaned_hash", cleaning_log["cleaned_hash"][:16])
         mlflow.log_param("valid_styles", ", ".join(cleaning_log["valid_styles"]))
         mlflow.log_param("outlier_columns", ", ".join(cleaning_log["outlier_columns"]))
+        mlflow.log_param("output_file", Path(cleaned_file).name)
 
         # --- Metrics: row counts ---
         mlflow.log_metrics({
@@ -342,7 +370,10 @@ def log_cleaning_to_mlflow(
             _log()
     else:
         mlflow.set_experiment(experiment_name)
-        with mlflow.start_run(run_name=f"data_cleaning_{ts}"):
+        scrape = cleaning_log.get("scrape_params", {})
+        loc_label = scrape.get("location", "").replace(",", "").replace(" ", "_")
+        run_label = f"cleaning_{loc_label}_{ts}" if loc_label else f"data_cleaning_{ts}"
+        with mlflow.start_run(run_name=run_label):
             _log()
 
     logger.info(f"Cleaning lineage logged to MLflow (experiment: {experiment_name})")
@@ -379,7 +410,7 @@ def main():
     # --- Clean ---
     df_clean, cleaning_log = clean_data(df_raw, iqr_multiplier=args.iqr_multiplier)
 
-    # Add scrape params to the log
+    # Add scrape params to the log (before MLflow so they're available for logging)
     cleaning_log["scrape_params"] = {
         "location": args.location,
         "listing_type": args.listing_type,
@@ -390,9 +421,8 @@ def main():
     output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-    csv_file = output_dir / f"cleaned_{ts}.csv"
+    filename = build_output_filename(args.location, args.past_days)
+    csv_file = output_dir / filename
     df_clean.to_csv(csv_file, index=False)
 
     # --- MLflow ---
