@@ -1,15 +1,16 @@
 """
-train_model.py – Housing Price Prediction: Random Forest Training & Tuning
-==========================================================================
-Uses Optuna (TPE-based Bayesian optimization) to tune a Random Forest
-regressor with 5-fold cross-validation. Every trial is tracked in MLflow.
-After tuning, the best model is retrained on the full dataset and logged
-as an MLflow artifact ready for serving via FastAPI / Streamlit.
+train_and_tune.py – Housing Price Prediction: RF + XGBoost Training & Tuning
+=============================================================================
+Uses Optuna (TPE-based Bayesian optimization) to tune both a Random Forest
+and an XGBoost regressor with 5-fold cross-validation. Every trial is
+tracked in MLflow. After tuning, the champion model (best CV Adj R²) is
+retrained on the full dataset, registered in the MLflow Model Registry,
+and automatically assigned the "champion" alias.
 
 Usage:
-    python train_model.py                          # defaults
-    python train_model.py --n_trials 100           # more tuning budget
-    python train_model.py --data path/to/data.csv  # custom data path
+    python train_and_tune.py                          # defaults
+    python train_and_tune.py --n_trials 100           # more tuning budget
+    python train_and_tune.py --data path/to/data.csv  # custom data path
 """
 
 import argparse
@@ -20,6 +21,7 @@ from pathlib import Path
 import joblib
 import mlflow
 import mlflow.sklearn
+import mlflow.xgboost
 import numpy as np
 import optuna
 import pandas as pd
@@ -27,6 +29,7 @@ from sklearn.ensemble import RandomForestRegressor
 from sklearn.model_selection import cross_val_score
 from sklearn.metrics import make_scorer, r2_score, mean_squared_error
 from mlflow.models.signature import infer_signature
+from xgboost import XGBRegressor
 
 
 def adjusted_r2(y_true, y_pred, n_features):
@@ -180,19 +183,22 @@ def build_feature_schema(feature_names: list[str]) -> dict:
 
 # ── CLI ──────────────────────────────────────────────────────────────────
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train & tune RF housing model")
+    parser = argparse.ArgumentParser(description="Train & tune RF + XGBoost housing models")
     parser.add_argument("--data", type=str, default="data/housing_engineered.csv",
                         help="Path to the engineered CSV")
     parser.add_argument("--n_trials", type=int, default=50,
-                        help="Number of Optuna trials (default: 50)")
+                        help="Number of Optuna trials per model (default: 50)")
     parser.add_argument("--cv_folds", type=int, default=5,
                         help="Number of CV folds (default: 5)")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed for reproducibility")
     parser.add_argument("--experiment_name", type=str,
-                        default="housing_price_rf",
+                        default="housing_price_prediction",
                         help="MLflow experiment name")
-    parser.add_argument("--model_output", type=str, default="models/best_rf_model.joblib",
+    parser.add_argument("--registered_model_name", type=str,
+                        default="housing_price_model",
+                        help="MLflow Model Registry name for champion model")
+    parser.add_argument("--model_output", type=str, default="models/best_model.joblib",
                         help="Path to save the final model locally")
     return parser.parse_args()
 
@@ -217,11 +223,16 @@ def load_data(path: str):
 
 
 # ── Optuna Objective ─────────────────────────────────────────────────────
-def create_objective(X, y, cv_folds, seed, n_features):
+def create_objective(X, y, cv_folds, seed, n_features, model_type="rf"):
     """Return an Optuna objective function that logs each trial to MLflow.
-    
+
     Optimises adjusted R² (maximise) to penalise complexity from the
     large number of one-hot encoded features.
+
+    Parameters
+    ----------
+    model_type : str
+        "rf" for Random Forest, "xgb" for XGBoost.
     """
     # Custom scorer: adjusted R² needs n_features, so we bake it in
     adj_r2_scorer = make_scorer(
@@ -229,22 +240,44 @@ def create_objective(X, y, cv_folds, seed, n_features):
     )
 
     def objective(trial: optuna.Trial) -> float:
-        params = {
-            "n_estimators":      trial.suggest_int("n_estimators", 100, 800, step=50),
-            "max_depth":         trial.suggest_int("max_depth", 5, 50),
-            "min_samples_split": trial.suggest_int("min_samples_split", 2, 20),
-            "min_samples_leaf":  trial.suggest_int("min_samples_leaf", 1, 15),
-            "max_features":      trial.suggest_categorical("max_features",
-                                                           ["sqrt", "log2", 0.3, 0.5, 0.7, 1.0]),
-            "random_state":      seed,
-            "n_jobs":            -1,
-        }
+        if model_type == "rf":
+            params = {
+                "n_estimators":      trial.suggest_int("n_estimators", 100, 800, step=50),
+                "max_depth":         trial.suggest_int("max_depth", 5, 50),
+                "min_samples_split": trial.suggest_int("min_samples_split", 2, 20),
+                "min_samples_leaf":  trial.suggest_int("min_samples_leaf", 1, 15),
+                "max_features":      trial.suggest_categorical("max_features",
+                                                               ["sqrt", "log2", 0.3, 0.5, 0.7, 1.0]),
+                "random_state":      seed,
+                "n_jobs":            -1,
+            }
+            model = RandomForestRegressor(**params)
 
-        rf = RandomForestRegressor(**params)
+        elif model_type == "xgb":
+            params = {
+                "n_estimators":   trial.suggest_int("n_estimators", 100, 1000, step=50),
+                "max_depth":      trial.suggest_int("max_depth", 3, 12),
+                "learning_rate":  trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
+                "subsample":      trial.suggest_float("subsample", 0.5, 1.0),
+                "colsample_bytree": trial.suggest_float("colsample_bytree", 0.3, 1.0),
+                "min_child_weight": trial.suggest_int("min_child_weight", 1, 10),
+                "reg_alpha":      trial.suggest_float("reg_alpha", 1e-8, 10.0, log=True),
+                "reg_lambda":     trial.suggest_float("reg_lambda", 1e-8, 10.0, log=True),
+                "gamma":          trial.suggest_float("gamma", 1e-8, 5.0, log=True),
+                "random_state":   seed,
+                "n_jobs":         -1,
+                "verbosity":      0,
+            }
+            model = XGBRegressor(**params)
+
+        else:
+            raise ValueError(f"Unknown model_type: {model_type}")
+
+        label = "RF" if model_type == "rf" else "XGB"
 
         # 5-fold CV with adjusted R² as the primary tuning metric
         adj_r2_scores = cross_val_score(
-            rf, X, y,
+            model, X, y,
             cv=cv_folds,
             scoring=adj_r2_scorer,
             n_jobs=-1,
@@ -254,19 +287,19 @@ def create_objective(X, y, cv_folds, seed, n_features):
 
         # Also compute RMSE, MAE, and standard R² for richer tracking
         neg_rmse_scores = cross_val_score(
-            rf, X, y,
+            model, X, y,
             cv=cv_folds,
             scoring="neg_root_mean_squared_error",
             n_jobs=-1,
         )
         mae_scores = cross_val_score(
-            rf, X, y,
+            model, X, y,
             cv=cv_folds,
             scoring="neg_mean_absolute_error",
             n_jobs=-1,
         )
         r2_scores = cross_val_score(
-            rf, X, y,
+            model, X, y,
             cv=cv_folds,
             scoring="r2",
             n_jobs=-1,
@@ -278,7 +311,7 @@ def create_objective(X, y, cv_folds, seed, n_features):
         mean_r2   = r2_scores.mean()
 
         # ── Log trial to MLflow ──
-        with mlflow.start_run(nested=True, run_name=f"trial_{trial.number}"):
+        with mlflow.start_run(nested=True, run_name=f"{label}_trial_{trial.number}"):
             mlflow.log_params(params)
             mlflow.log_metrics({
                 "cv_adj_r2_mean": round(mean_adj_r2, 4),
@@ -289,8 +322,9 @@ def create_objective(X, y, cv_folds, seed, n_features):
                 "cv_mae_mean":    round(mean_mae, 2),
             })
             mlflow.set_tag("trial_number", trial.number)
+            mlflow.set_tag("model_type", model_type)
 
-        print(f"  Trial {trial.number:>3d}  |  Adj R²: {mean_adj_r2:.4f}  "
+        print(f"  {label} Trial {trial.number:>3d}  |  Adj R²: {mean_adj_r2:.4f}  "
               f"(±{std_adj_r2:.4f})  |  RMSE: ${mean_rmse:>10,.2f}  |  R²: {mean_r2:.4f}")
 
         return mean_adj_r2   # Optuna maximises this
@@ -300,29 +334,42 @@ def create_objective(X, y, cv_folds, seed, n_features):
 
 # ── Final Model Training ─────────────────────────────────────────────────
 def train_final_model(X, y, best_params, feature_names, model_output, seed,
-                      best_trial_metrics):
-    """Retrain on full dataset with best hyperparameters and log to MLflow."""
+                      best_trial_metrics, model_type="rf"):
+    """Retrain on full dataset with best hyperparameters and log to MLflow.
+
+    Returns the trained model, the MLflow run ID, and the logged model URI.
+    """
+    label = "Random Forest" if model_type == "rf" else "XGBoost"
     print("\n" + "=" * 65)
-    print("RETRAINING FINAL MODEL ON FULL DATASET")
+    print(f"RETRAINING FINAL {label.upper()} MODEL ON FULL DATASET")
     print("=" * 65)
 
-    best_params["random_state"] = seed
-    best_params["n_jobs"] = -1
+    if model_type == "rf":
+        best_params["random_state"] = seed
+        best_params["n_jobs"] = -1
+        final_model = RandomForestRegressor(**best_params)
+    else:
+        best_params["random_state"] = seed
+        best_params["n_jobs"] = -1
+        best_params["verbosity"] = 0
+        final_model = XGBRegressor(**best_params)
 
-    final_rf = RandomForestRegressor(**best_params)
-    final_rf.fit(X, y)
+    final_model.fit(X, y)
 
     # ── Model signature for MLflow serving ──
     sample_input = pd.DataFrame(X[:5], columns=feature_names)
-    sample_output = final_rf.predict(sample_input)
+    sample_output = final_model.predict(sample_input)
     signature = infer_signature(sample_input, sample_output)
 
     # ── Log final model to MLflow ──
-    with mlflow.start_run(nested=True, run_name="final_model"):
+    artifact_path = f"{model_type}_model"
+    log_func = mlflow.sklearn.log_model if model_type == "rf" else mlflow.xgboost.log_model
+
+    with mlflow.start_run(nested=True, run_name=f"final_{model_type}_model") as run:
         mlflow.log_params(best_params)
 
         # In-sample metrics (sanity check, not evaluation)
-        train_preds = final_rf.predict(X)
+        train_preds = final_model.predict(X)
         train_rmse = np.sqrt(np.mean((y - train_preds) ** 2))
         train_mae  = np.mean(np.abs(y - train_preds))
         n_features = X.shape[1] if hasattr(X, 'shape') else len(feature_names)
@@ -340,12 +387,20 @@ def train_final_model(X, y, best_params, feature_names, model_output, seed,
         mlflow.log_metrics(best_trial_metrics)
 
         # Log the model with signature and feature list
-        mlflow.sklearn.log_model(
-            sk_model=final_rf,
-            artifact_path="random_forest_model",
-            signature=signature,
-            input_example=sample_input.iloc[:1],
-        )
+        if model_type == "rf":
+            log_func(
+                sk_model=final_model,
+                artifact_path=artifact_path,
+                signature=signature,
+                input_example=sample_input.iloc[:1],
+            )
+        else:
+            log_func(
+                xgb_model=final_model,
+                artifact_path=artifact_path,
+                signature=signature,
+                input_example=sample_input.iloc[:1],
+            )
 
         # Log feature names as artifact for downstream use
         feature_artifact = {"feature_names": feature_names}
@@ -365,7 +420,7 @@ def train_final_model(X, y, best_params, feature_names, model_output, seed,
               f"{len(schema['binary_features'])} binary")
 
         # Feature importance top 15
-        importances = final_rf.feature_importances_
+        importances = final_model.feature_importances_
         feat_imp = sorted(zip(feature_names, importances),
                           key=lambda x: x[1], reverse=True)
         imp_df = pd.DataFrame(feat_imp[:15], columns=["feature", "importance"])
@@ -374,22 +429,25 @@ def train_final_model(X, y, best_params, feature_names, model_output, seed,
         mlflow.log_artifact(str(imp_path))
         imp_path.unlink()
 
-        mlflow.set_tag("model_type", "final_production")
-        final_run_id = mlflow.active_run().info.run_id
+        mlflow.set_tag("model_type", model_type)
+        mlflow.set_tag("stage", "final_production")
+        final_run_id = run.info.run_id
+        model_uri = f"runs:/{final_run_id}/{artifact_path}"
 
     # ── Save locally with joblib ──
     output_path = Path(model_output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    joblib.dump(final_rf, output_path)
+    joblib.dump(final_model, output_path)
 
     # Also save feature schema alongside the model for local use
     meta_path = output_path.with_suffix(".meta.json")
     schema = build_feature_schema(feature_names)
     schema["n_features"] = len(feature_names)
     schema["training_rows"] = X.shape[0]
+    schema["model_type"] = model_type
     meta_path.write_text(json.dumps(schema, indent=2))
 
-    print(f"\nFinal model saved to: {output_path}")
+    print(f"\n{label} model saved to: {output_path}")
     print(f"Feature metadata:     {meta_path}")
     print(f"MLflow run ID:        {final_run_id}")
 
@@ -403,7 +461,57 @@ def train_final_model(X, y, best_params, feature_names, model_output, seed,
     for feat, imp in feat_imp[:10]:
         print(f"  {feat:<30s}  {imp:.4f}")
 
-    return final_rf, final_run_id
+    return final_model, final_run_id, model_uri
+
+
+# ── Helper: Run Optuna Study for a Single Model Type ────────────────────
+def run_optuna_study(X, y, model_type, n_trials, cv_folds, seed, n_features):
+    """Run an Optuna study for a given model type and return the study."""
+    label = "Random Forest" if model_type == "rf" else "XGBoost"
+    study_name = f"{model_type}_housing_tuning"
+
+    print(f"\n{'=' * 65}")
+    print(f"  TUNING {label.upper()}: {n_trials} trials, {cv_folds}-fold CV")
+    print(f"{'=' * 65}")
+
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    study = optuna.create_study(
+        direction="maximize",
+        sampler=optuna.samplers.TPESampler(seed=seed),
+        study_name=study_name,
+    )
+    study.optimize(
+        create_objective(X, y, cv_folds, seed, n_features, model_type=model_type),
+        n_trials=n_trials,
+        show_progress_bar=True,
+    )
+
+    best = study.best_trial
+    print(f"\n  BEST {label.upper()} TRIAL: #{best.number}")
+    print(f"  CV Adj R²: {best.value:.4f}")
+    print(f"  Params:    {json.dumps(best.params, indent=4)}")
+
+    return study
+
+
+def retrieve_best_trial_cv_metrics(best_trial_number, model_type):
+    """Look up the CV metrics logged in MLflow for the best Optuna trial."""
+    best_trial_run = mlflow.search_runs(
+        filter_string=(
+            f"tags.trial_number = '{best_trial_number}' "
+            f"and tags.model_type = '{model_type}'"
+        ),
+        order_by=["attributes.start_time DESC"],
+        max_results=1,
+    )
+    best_trial_metrics = {}
+    for col in best_trial_run.columns:
+        if col.startswith("metrics.cv_"):
+            metric_name = col.replace("metrics.", "best_")
+            val = best_trial_run[col].iloc[0]
+            if pd.notna(val):
+                best_trial_metrics[metric_name] = round(val, 4)
+    return best_trial_metrics
 
 
 # ── Main ─────────────────────────────────────────────────────────────────
@@ -415,73 +523,118 @@ def main():
     # ── MLflow setup ──
     mlflow.set_experiment(args.experiment_name)
 
-    with mlflow.start_run(run_name="optuna_tuning_session") as parent_run:
+    with mlflow.start_run(run_name="dual_model_tuning_session") as parent_run:
         mlflow.set_tag("stage", "hyperparameter_tuning")
         mlflow.log_params({
-            "n_trials":    args.n_trials,
-            "cv_folds":    args.cv_folds,
-            "seed":        args.seed,
-            "data_path":   args.data,
-            "n_rows":      X.shape[0],
-            "n_features":  X.shape[1],
+            "n_trials_per_model": args.n_trials,
+            "cv_folds":           args.cv_folds,
+            "seed":               args.seed,
+            "data_path":          args.data,
+            "n_rows":             X.shape[0],
+            "n_features":         X.shape[1],
         })
 
-        # ── Optuna study ──
-        print(f"\nStarting Optuna tuning: {args.n_trials} trials, "
-              f"{args.cv_folds}-fold CV\n" + "-" * 65)
+        n_features = X.shape[1]
 
-        optuna.logging.set_verbosity(optuna.logging.WARNING)
-        study = optuna.create_study(
-            direction="maximize",
-            sampler=optuna.samplers.TPESampler(seed=args.seed),
-            study_name="rf_housing_tuning",
-        )
-        study.optimize(
-            create_objective(X, y, args.cv_folds, args.seed, X.shape[1]),
-            n_trials=args.n_trials,
-            show_progress_bar=True,
-        )
+        # ── Run Optuna for both model types ──
+        rf_study  = run_optuna_study(X, y, "rf",  args.n_trials, args.cv_folds, args.seed, n_features)
+        xgb_study = run_optuna_study(X, y, "xgb", args.n_trials, args.cv_folds, args.seed, n_features)
 
-        # ── Log best trial results to parent run ──
-        best = study.best_trial
+        rf_best  = rf_study.best_trial
+        xgb_best = xgb_study.best_trial
+
+        # ── Log best results for both to parent run ──
         mlflow.log_metrics({
-            "best_cv_adj_r2": round(best.value, 4),
-            "best_trial_num": best.number,
+            "rf_best_cv_adj_r2":  round(rf_best.value, 4),
+            "rf_best_trial_num":  rf_best.number,
+            "xgb_best_cv_adj_r2": round(xgb_best.value, 4),
+            "xgb_best_trial_num": xgb_best.number,
         })
-        mlflow.log_params({f"best_{k}": v for k, v in best.params.items()})
+
+        # ── Determine champion ──
+        if xgb_best.value > rf_best.value:
+            champion_type  = "xgb"
+            champion_study = xgb_study
+            challenger_type = "rf"
+        else:
+            champion_type  = "rf"
+            champion_study = rf_study
+            challenger_type = "xgb"
+
+        champion_best = champion_study.best_trial
+        champion_label = "XGBoost" if champion_type == "xgb" else "Random Forest"
 
         print(f"\n{'=' * 65}")
-        print(f"BEST TRIAL: #{best.number}")
-        print(f"  CV Adj R²: {best.value:.4f}")
-        print(f"  Params:    {json.dumps(best.params, indent=4)}")
+        print(f"  CHAMPION: {champion_label}  (CV Adj R² = {champion_best.value:.4f})")
+        print(f"  RF best:  {rf_best.value:.4f}  |  XGB best: {xgb_best.value:.4f}")
+        print(f"{'=' * 65}")
 
-        # ── Train final model ──
-        # Retrieve the best trial's CV metrics from its MLflow run
-        best_trial_run = mlflow.search_runs(
-            filter_string=f"tags.trial_number = '{best.number}'",
-            order_by=["attributes.start_time DESC"],
-            max_results=1,
+        mlflow.set_tag("champion_model_type", champion_type)
+
+        # ── Train final models for both (logged as nested runs) ──
+        results = {}
+        for mtype, study in [("rf", rf_study), ("xgb", xgb_study)]:
+            best = study.best_trial
+            cv_metrics = retrieve_best_trial_cv_metrics(best.number, mtype)
+
+            suffix = "_rf" if mtype == "rf" else "_xgb"
+            base = Path(args.model_output)
+            output_path = str(base.parent / f"{base.stem}{suffix}.joblib")
+
+            model, run_id, model_uri = train_final_model(
+                X, y, best.params.copy(), feature_names,
+                output_path, args.seed, cv_metrics, model_type=mtype,
+            )
+            results[mtype] = {
+                "model": model,
+                "run_id": run_id,
+                "model_uri": model_uri,
+                "cv_adj_r2": best.value,
+            }
+
+        # ── Register champion in MLflow Model Registry & set alias ──
+        champion_uri = results[champion_type]["model_uri"]
+        print(f"\nRegistering champion ({champion_label}) in Model Registry "
+              f"as '{args.registered_model_name}' ...")
+
+        mv = mlflow.register_model(
+            model_uri=champion_uri,
+            name=args.registered_model_name,
         )
-        best_trial_metrics = {}
-        for col in best_trial_run.columns:
-            if col.startswith("metrics.cv_"):
-                metric_name = col.replace("metrics.", "best_")
-                val = best_trial_run[col].iloc[0]
-                if pd.notna(val):
-                    best_trial_metrics[metric_name] = round(val, 4)
+        print(f"  Registered version: {mv.version}")
 
-        final_model, final_run_id = train_final_model(
-            X, y, best.params.copy(), feature_names,
-            args.model_output, args.seed, best_trial_metrics,
+        client = mlflow.tracking.MlflowClient()
+        client.set_registered_model_alias(
+            name=args.registered_model_name,
+            alias="champion",
+            version=mv.version,
+        )
+        print(f"  Alias 'champion' → version {mv.version} ({champion_label})")
+
+        # Tag the champion version with useful metadata
+        client.set_model_version_tag(
+            name=args.registered_model_name,
+            version=mv.version,
+            key="model_type",
+            value=champion_type,
+        )
+        client.set_model_version_tag(
+            name=args.registered_model_name,
+            version=mv.version,
+            key="cv_adj_r2",
+            value=str(round(champion_best.value, 4)),
         )
 
-        # Log the parent run ID for easy lookup
         parent_id = parent_run.info.run_id
         print(f"\nParent MLflow run ID: {parent_id}")
 
     print("\nDone! To view results:")
     print("  mlflow ui --port 5000")
     print(f"  Then open http://localhost:5000")
+    print(f"\nTo load the champion model:")
+    print(f"  import mlflow")
+    print(f"  model = mlflow.pyfunc.load_model("
+          f"'models:/{args.registered_model_name}@champion')")
 
 
 if __name__ == "__main__":
