@@ -5,13 +5,17 @@ Reads validated/cleaned housing data from the processed/ folder,
 applies feature engineering transformations, logs metadata to MLflow,
 and writes the engineered dataset to the training/ folder.
 
+Auto-discovers the most recent file in data/processed/ by default,
+and derives the output filename from the input (e.g.
+validated_Cincinnati_OH_365d_20250414_183022.csv → engineered_Cincinnati_OH_365d_20250414_183022.csv).
+
 Usage:
-    python feature_engineering.py
-    python feature_engineering.py --input data/processed/my_file.csv
+    python feature_engineering.py                              # auto-discover latest
+    python feature_engineering.py --input data/processed/my_file.csv  # specific file
 
 MLflow Tracking (Light):
     - Parameters: input file, output file, number of raw/engineered features, row count
-    - Tags: list of transformations applied, dataset version
+    - Tags: list of transformations applied, dataset version, source file
     - Metrics: null counts, feature count delta
 """
 
@@ -31,11 +35,41 @@ import mlflow
 
 PROCESSED_DIR = Path("data/processed")
 TRAINING_DIR = Path("data/training")
-INPUT_FILENAME = "housing_cleaned.csv"  # adjust to your actual filename
-OUTPUT_FILENAME = "housing_engineered.csv"
 
 MLFLOW_EXPERIMENT_NAME = "housing-feature-engineering"
 MLFLOW_TRACKING_URI = "sqlite:///mlflow.db"  # SQLite backend (recommended over filesystem)
+
+
+# ──────────────────────────────────────────────
+# FILE DISCOVERY
+# ──────────────────────────────────────────────
+
+def find_latest_processed_file(directory: Path = PROCESSED_DIR) -> Path:
+    """Find the most recently modified CSV in data/processed/."""
+    csv_files = sorted(directory.glob("*.csv"), key=lambda f: f.stat().st_mtime)
+    if not csv_files:
+        raise FileNotFoundError(
+            f"No CSV files found in {directory}. "
+            f"Run Data_validation.py first."
+        )
+    latest = csv_files[-1]
+    logger.info(f"Found latest processed file: {latest}")
+    return latest
+
+
+def build_output_filename(source_name: str) -> str:
+    """Derive output name from input: validated_X.csv → engineered_X.csv.
+
+    Strips any known verb prefix from the source and replaces it with 'engineered_'.
+    """
+    KNOWN_PREFIXES = ("validated_", "approved_", "fixed_",
+                      "quarantined_", "rejected_", "removed_")
+    clean_name = source_name
+    for prefix in KNOWN_PREFIXES:
+        if clean_name.startswith(prefix):
+            clean_name = clean_name[len(prefix):]
+            break
+    return f"engineered_{clean_name}"
 
 # ──────────────────────────────────────────────
 # LOGGING
@@ -334,8 +368,9 @@ PIPELINE = [
 def run_feature_engineering(input_file: str | None = None):
     """Execute the full feature engineering pipeline with MLflow tracking."""
 
-    input_path = Path(input_file) if input_file else PROCESSED_DIR / INPUT_FILENAME
-    output_path = TRAINING_DIR / OUTPUT_FILENAME
+    input_path = Path(input_file) if input_file else find_latest_processed_file()
+    output_name = build_output_filename(input_path.name)
+    output_path = TRAINING_DIR / output_name
 
     # ── Validate paths ──
     if not input_path.exists():
@@ -354,11 +389,13 @@ def run_feature_engineering(input_file: str | None = None):
     mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
     mlflow.set_experiment(MLFLOW_EXPERIMENT_NAME)
 
-    with mlflow.start_run(run_name=f"feat_eng_{datetime.now():%Y%m%d_%H%M%S}"):
+    source_label = input_path.stem
+    with mlflow.start_run(run_name=f"feat_eng_{source_label}"):
 
         # Log input metadata
-        mlflow.log_param("input_file", str(input_path))
-        mlflow.log_param("output_file", str(output_path))
+        mlflow.log_param("input_file", input_path.name)
+        mlflow.log_param("input_path", str(input_path))
+        mlflow.log_param("output_file", output_name)
         mlflow.log_param("raw_rows", raw_shape[0])
         mlflow.log_param("raw_features", raw_shape[1])
 
@@ -385,6 +422,7 @@ def run_feature_engineering(input_file: str | None = None):
 
         mlflow.set_tag("pipeline_stage", "feature_engineering")
         mlflow.set_tag("dataset_version", datetime.now().strftime("%Y%m%d"))
+        mlflow.set_tag("source_file", input_path.name)
 
         # ── Save engineered dataset ──
         df.to_csv(output_path, index=False)
@@ -393,6 +431,7 @@ def run_feature_engineering(input_file: str | None = None):
         # ── Summary ──
         logger.info("─" * 50)
         logger.info("Feature Engineering Summary")
+        logger.info(f"  Input:      {input_path}")
         logger.info(f"  Raw:        {raw_shape[0]} rows × {raw_shape[1]} cols")
         logger.info(f"  Engineered: {eng_shape[0]} rows × {eng_shape[1]} cols")
         logger.info(f"  Transforms: {TRANSFORMATIONS_APPLIED}")
@@ -409,7 +448,7 @@ if __name__ == "__main__":
         "--input",
         type=str,
         default=None,
-        help=f"Path to input CSV (default: {PROCESSED_DIR / INPUT_FILENAME})",
+        help="Path to input CSV (default: most recent file in data/processed/)",
     )
     args = parser.parse_args()
     run_feature_engineering(input_file=args.input)
