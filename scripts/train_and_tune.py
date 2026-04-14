@@ -592,26 +592,39 @@ def main():
                 "cv_adj_r2": best.value,
             }
 
-        # ── Register champion in MLflow Model Registry & set alias ──
+        # ── Register & conditionally promote to champion ────────────
         champion_uri = results[champion_type]["model_uri"]
-        print(f"\nRegistering champion ({champion_label}) in Model Registry "
-              f"as '{args.registered_model_name}' ...")
+        new_score = round(champion_best.value, 4)
 
+        client = mlflow.tracking.MlflowClient()
+
+        # Check if there's an existing champion to defend its title
+        existing_champion_score = None
+        try:
+            existing_mv = client.get_model_version_by_alias(
+                name=args.registered_model_name,
+                alias="champion",
+            )
+            existing_champion_score_str = existing_mv.tags.get("cv_adj_r2")
+            if existing_champion_score_str is not None:
+                existing_champion_score = float(existing_champion_score_str)
+                existing_type = existing_mv.tags.get("model_type", "unknown")
+                print(f"\nExisting champion: v{existing_mv.version} "
+                      f"({existing_type}, CV Adj R² = {existing_champion_score:.4f})")
+        except Exception:
+            # No registered model or no champion alias yet — first run
+            print(f"\nNo existing champion found — this will be the first.")
+
+        # Always register the new version for auditability
+        print(f"\nRegistering this run's best model ({champion_label}) in "
+              f"'{args.registered_model_name}' ...")
         mv = mlflow.register_model(
             model_uri=champion_uri,
             name=args.registered_model_name,
         )
         print(f"  Registered version: {mv.version}")
 
-        client = mlflow.tracking.MlflowClient()
-        client.set_registered_model_alias(
-            name=args.registered_model_name,
-            alias="champion",
-            version=mv.version,
-        )
-        print(f"  Alias 'champion' → version {mv.version} ({champion_label})")
-
-        # Tag the champion version with useful metadata
+        # Tag the new version regardless of promotion
         client.set_model_version_tag(
             name=args.registered_model_name,
             version=mv.version,
@@ -622,8 +635,41 @@ def main():
             name=args.registered_model_name,
             version=mv.version,
             key="cv_adj_r2",
-            value=str(round(champion_best.value, 4)),
+            value=str(new_score),
         )
+
+        # Only promote if the new model actually beats the incumbent
+        if existing_champion_score is not None and new_score <= existing_champion_score:
+            print(f"\n  New model CV Adj R² ({new_score:.4f}) does NOT beat "
+                  f"existing champion ({existing_champion_score:.4f}).")
+            print(f"  Champion alias stays on v{existing_mv.version}. "
+                  f"New model registered as v{mv.version} (challenger).")
+            client.set_registered_model_alias(
+                name=args.registered_model_name,
+                alias="challenger",
+                version=mv.version,
+            )
+        else:
+            client.set_registered_model_alias(
+                name=args.registered_model_name,
+                alias="champion",
+                version=mv.version,
+            )
+            if existing_champion_score is not None:
+                print(f"\n  NEW CHAMPION! CV Adj R² improved: "
+                      f"{existing_champion_score:.4f} → {new_score:.4f}")
+                # Reassign old champion as the previous alias for rollback
+                client.set_registered_model_alias(
+                    name=args.registered_model_name,
+                    alias="previous_champion",
+                    version=existing_mv.version,
+                )
+                print(f"  Previous champion (v{existing_mv.version}) aliased "
+                      f"as 'previous_champion'")
+            else:
+                print(f"\n  First champion set! "
+                      f"v{mv.version} ({champion_label}, CV Adj R² = {new_score:.4f})")
+            print(f"  Alias 'champion' → v{mv.version}")
 
         parent_id = parent_run.info.run_id
         print(f"\nParent MLflow run ID: {parent_id}")

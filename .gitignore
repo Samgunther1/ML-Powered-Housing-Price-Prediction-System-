@@ -235,7 +235,7 @@ data/cleaned/
 # Trained models
 models/*.joblib
 models/*.meta.json
-
+mlflow.db
 # MLflow local runs
 mlruns/
 mlartifacts/
