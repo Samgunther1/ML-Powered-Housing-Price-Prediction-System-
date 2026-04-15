@@ -37,7 +37,7 @@ PROCESSED_DIR = Path("data/processed")
 TRAINING_DIR = Path("data/training")
 
 MLFLOW_EXPERIMENT_NAME = "housing-feature-engineering"
-MLFLOW_TRACKING_URI = "sqlite:///mlflow.db"  # SQLite backend (recommended over filesystem)
+MLFLOW_TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI", "sqlite:///mlflow.db")
 
 
 # ──────────────────────────────────────────────

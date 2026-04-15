@@ -38,6 +38,7 @@ Usage:
 import hashlib
 import json
 import logging
+import os
 import shutil
 import argparse
 import getpass
@@ -125,8 +126,8 @@ NOT_NULL_EXPECTATIONS = {
 
 # Range checks — outliers should already be removed, so these act as a safety net
 RANGE_EXPECTATIONS = {
-    "list_price": (50_000, 100_000_000, 1.0),
-    "sold_price": (50_000, 100_000_000, 1.0),
+    "list_price": (100_000, 10_000_000, 1.0),
+    "sold_price": (100_000, 10_000_000, 1.0),
     "sqft": (100, 50_000, 0.98),
     "beds": (0, 20, 1.0),
     "full_baths": (0, 20, 1.0),
@@ -515,7 +516,7 @@ def _log_review_to_mlflow(
         )
         return
 
-    mlflow.set_tracking_uri("sqlite:///mlflow.db")
+    mlflow.set_tracking_uri(os.getenv("MLFLOW_TRACKING_URI", "sqlite:///mlflow.db"))
     mlflow.set_experiment(experiment_name)
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -863,7 +864,7 @@ def fix_and_approve(
             mlflow = None
 
         if mlflow:
-            mlflow.set_tracking_uri("sqlite:///mlflow.db")
+            mlflow.set_tracking_uri(os.getenv("MLFLOW_TRACKING_URI", "sqlite:///mlflow.db"))
             mlflow.set_experiment(REVIEW_EXPERIMENT_NAME)
             run_name = f"review_fix_{src.stem}_{ts}"
 
@@ -1055,7 +1056,7 @@ def validate_and_log_to_mlflow(
     source_label = Path(source_file).stem if source_file else ts
     outcome = "passed" if success else "quarantined"
 
-    mlflow.set_tracking_uri("sqlite:///mlflow.db")
+    mlflow.set_tracking_uri(os.getenv("MLFLOW_TRACKING_URI", "sqlite:///mlflow.db"))
     if run_id:
         with mlflow.start_run(run_id=run_id):
             _log()

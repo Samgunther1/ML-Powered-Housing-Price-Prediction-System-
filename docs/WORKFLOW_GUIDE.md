@@ -1,238 +1,228 @@
-# Housing Price Predictor — Full Workflow Guide
+# Housing Price Prediction — End-to-End Workflow
 
-This guide walks through every step of training a new model and deploying it for predictions. Follow this any time you retrain — whether you changed features, added data, or just want to tune with more trials.
-
----
-
-## Architecture Overview
-
-The system has three components, each running in its own Docker container:
-
-```
-┌──────────────────┐     ┌──────────────────┐     ┌──────────────────┐
-│   Streamlit UI   │────▶│   FastAPI API     │────▶│   MLflow Server  │
-│  localhost:8501   │     │  localhost:8000    │     │  localhost:5000   │
-│                  │     │                  │     │                  │
-│  Builds form     │     │  Loads champion   │     │  Stores models,  │
-│  dynamically     │     │  model + schema   │     │  artifacts,      │
-│  from /schema    │     │  from MLflow      │     │  metrics         │
-└──────────────────┘     └──────────────────┘     └──────────────────┘
-```
-
-**Data flow for a prediction:**
-1. User fills out the form in Streamlit (beds, baths, city, etc.)
-2. Streamlit sends the raw inputs to FastAPI
-3. FastAPI encodes the inputs into the 107-feature vector using the feature schema
-4. FastAPI runs the model and returns the predicted price
-5. Streamlit displays the result
+A step-by-step guide for building, validating, training, and deploying a new housing price model in this system.
 
 ---
 
-## Step 1: Start the Docker Containers
+## Prerequisites
 
-Open PowerShell, navigate to your repo, and start the containers:
-
-```powershell
-cd C:\Users\Samg1\BANA_7075_FINAL\ML-Powered-Housing-Price-Prediction-System-
-docker compose up --build -d
-```
-
-Wait about 15-20 seconds for all three containers to become healthy. You can verify with:
+Before starting, make sure the Docker stack is running. All pipeline scripts log to the Docker MLflow server when the tracking URI is set.
 
 ```powershell
+# Start the full stack
+docker compose up -d
+
+# Verify all services are healthy
 docker compose ps
+
+# Set the tracking URI for this terminal session
+$env:MLFLOW_TRACKING_URI = "http://localhost:5000"
 ```
 
-All three should show "healthy" or "running" status.
+You should see three healthy containers: `mlflow-server`, `housing-api`, and `housing-ui`.
 
 ---
 
-## Step 2: Train and Tune the Model
+## Step 1: Scrape & Clean
 
-In the **same PowerShell window** (or a new one), point your local MLflow client at the Dockerized MLflow server and run the training script:
+Scrape recent housing data from Realtor.com via HomeHarvest and apply initial cleaning (dedup, null removal, outlier filtering via IQR).
 
 ```powershell
-$env:MLFLOW_TRACKING_URI = "http://localhost:5000"
-python scripts/train_and_tune.py --data data/training/housing_engineered.csv --n_trials 50
+python scripts/scrape_and_clean.py --location "Cincinnati, OH" --past_days 365 --mlflow
 ```
 
-**What this does:**
-- Loads `housing_engineered.csv` and splits it into features (X) and target (sold_price)
-- Runs 50 Optuna trials, each testing different Random Forest hyperparameters
-- Each trial performs 5-fold cross-validation and is scored on **adjusted R²**
-- Every trial's params and metrics are logged to MLflow as nested runs
-- After tuning, the best hyperparameters retrain a final model on all 8,012 rows
-- The final model, feature schema, feature importances, and feature names are logged as MLflow artifacts
-- A local copy is saved to `models/best_rf_model.joblib`
+**Key flags:**
 
-**Timing:** ~30-40 minutes for 50 trials. Use `--n_trials 5` for a quick test.
+- `--location` — target geography (e.g., `"Cincinnati, OH"`, `"Hamilton County, OH"`)
+- `--past_days` — how far back to scrape (365 = one year of sold listings)
+- `--iqr_multiplier` — outlier sensitivity (default 1.5; use 2.0 for a more lenient filter)
+- `--mlflow` — log cleaning lineage to MLflow (always recommended)
 
-**What gets logged to MLflow per trial:**
-- `cv_adj_r2_mean` — the primary optimization metric
-- `cv_r2_mean` — standard R² for comparison
-- `cv_rmse_mean` — root mean squared error in dollars
-- `cv_mae_mean` — mean absolute error in dollars
-- All hyperparameters (n_estimators, max_depth, etc.)
+**Output:** A cleaned CSV in `data/cleaned/` named like `Cincinnati_OH_365d_20260415_140000.csv`.
 
-**What gets logged for the final model:**
-- Training metrics (train_rmse, train_r2, train_adj_r2, etc.)
-- Best trial's CV metrics carried forward (best_cv_adj_r2_mean, etc.)
-- `random_forest_model/` — the serialized model for serving
-- `feature_schema.json` — the dynamic schema that drives the API and UI
-- `feature_names.json` — ordered list of all feature columns
-- `feature_importances.csv` — top 15 features by importance
+**What gets logged to MLflow:** Row counts per cleaning step, IQR bounds, dataset hashes, removal percentages.
 
 ---
 
-## Step 3: Register the Model in MLflow
+## Step 2: Validate
 
-Open **http://localhost:5000** in your browser.
+Run Great Expectations validation on the cleaned data. Files that pass move to `data/processed/`; files that fail are quarantined to `data/errors/`.
 
-1. Click the **housing_price_rf** experiment (left sidebar)
-2. Click the **▶ expand arrow** next to the latest `optuna_tuning_session` run
-3. Click on the **final_model** nested run
-4. Click the **Artifacts** tab
-5. Verify you see: `feature_schema.json`, `feature_names.json`, `feature_importances.csv`, and `random_forest_model/`
-6. Click on the **random_forest_model** folder
-7. Click **Register Model**
-8. If this is your first time: enter the name `housing_price_rf` and click Register
-9. If a registered model already exists: select `housing_price_rf` from the dropdown
+```powershell
+python scripts/Data_validation.py --mlflow
+```
+
+This auto-discovers the most recent file in `data/cleaned/`. To validate a specific file:
+
+```powershell
+python scripts/Data_validation.py --file data/cleaned/Cincinnati_OH_365d_20260415_140000.csv --mlflow
+```
+
+**Output naming:**
+
+- Pass → `data/processed/validated_Cincinnati_OH_365d_20260415_140000.csv`
+- Fail → `data/errors/quarantined_Cincinnati_OH_365d_20260415_140000.csv`
+
+### Handling Quarantined Files
+
+If validation fails, you have three options:
+
+**Review what failed:**
+```powershell
+python scripts/Data_validation.py --review
+```
+
+**Fix by removing bad rows (most common):**
+```powershell
+python scripts/Data_validation.py --fix data/errors/quarantined_Cincinnati_OH_365d_20260415_140000.csv --filter "beds>20" --filter "sold_price<10000" --reason "Removed outliers missed by IQR"
+```
+
+**Approve as-is (if failures are acceptable):**
+```powershell
+python scripts/Data_validation.py --approve data/errors/quarantined_Cincinnati_OH_365d_20260415_140000.csv --reason "Minor nulls in lot_sqft, acceptable for modeling"
+```
+
+**Reject (re-scrape needed):**
+```powershell
+python scripts/Data_validation.py --reject data/errors/quarantined_Cincinnati_OH_365d_20260415_140000.csv --reason "Sold_price distribution too skewed"
+```
+
+All review decisions are logged to MLflow with the reviewer name, reason, and audit trail.
 
 ---
 
-## Step 4: Set the Champion Alias
+## Step 3: Feature Engineering
 
-1. Click **Model registry** in the left sidebar
-2. Click on **housing_price_rf**
-3. Click on the **latest version** (e.g., Version 2)
-4. Under **Aliases**, click **Add** → type `champion` → save
+Transform the validated data into model-ready features (imputation, one-hot encoding, derived features).
 
-If an older version already has the `champion` alias, MLflow automatically moves it to the new version.
+```powershell
+python scripts/feature_engineering.py
+```
+
+This auto-discovers the most recent file in `data/processed/`. To use a specific file:
+
+```powershell
+python scripts/feature_engineering.py --input data/processed/validated_Cincinnati_OH_365d_20260415_140000.csv
+```
+
+**Output:** `data/training/engineered_Cincinnati_OH_365d_20260415_140000.csv`
+
+**What gets logged to MLflow:** Input/output shapes, transformations applied, null counts, feature count delta.
 
 ---
 
-## Step 5: Restart the API
+## Step 4: Train & Tune
 
-The API loads the model on startup, so you need to restart it to pick up the new champion:
+Run Optuna hyperparameter tuning for both Random Forest and XGBoost, then automatically register the best model.
+
+```powershell
+python scripts/train_and_tune.py --n_trials 50
+```
+
+This auto-discovers the most recent file in `data/training/`. To use a specific file:
+
+```powershell
+python scripts/train_and_tune.py --data data/training/engineered_Cincinnati_OH_365d_20260415_140000.csv --n_trials 50
+```
+
+**Key flags:**
+
+- `--n_trials` — Optuna trials per model type (50 for quick iteration, 150-200 for a final push)
+- `--cv_folds` — cross-validation folds (default 5)
+- `--seed` — random seed for reproducibility (default 42)
+- `--registered_model_name` — MLflow registry name (default `housing_price_model`)
+
+**What happens during training:**
+
+1. Runs a separate Optuna study for Random Forest and XGBoost
+2. Compares the best CV Adjusted R² from each
+3. Retrains both final models on the full dataset
+4. Registers the session's best model in the MLflow Model Registry
+5. Compares against the existing champion — only promotes if the new model scores higher
+6. Assigns the `champion` alias to the winner; demoted model gets `previous_champion`
+
+**What gets logged to MLflow:** Every trial's hyperparameters and CV metrics, best trial results, final model artifacts, feature importances, feature schema.
+
+### Understanding the Champion System
+
+The script uses a defend-the-title approach:
+
+- **First run ever:** The best model automatically becomes champion.
+- **Subsequent runs:** The new model must beat the existing champion's CV Adj R² to earn the alias. If it doesn't, it's registered as `challenger` and the incumbent keeps the crown.
+- **Rollback:** The `previous_champion` alias always points to the last dethroned model, so you can roll back by manually reassigning the alias in MLflow if needed.
+
+---
+
+## Step 5: Deploy
+
+Restart the API container to load the new champion model:
 
 ```powershell
 docker compose restart api
 ```
 
-Wait 10 seconds, then verify:
+Verify the new model loaded:
 
 ```powershell
 curl http://localhost:8000/health
 ```
 
-You should see:
-```json
-{"status": "healthy", "model_loaded": true, "schema_loaded": true, ...}
-```
+You should see `"model_loaded": true` and the updated feature count. The Streamlit UI at `http://localhost:8501` will reflect the new model immediately on the Model Dashboard tab.
 
 ---
 
-## Step 6: Make Predictions
-
-- **Streamlit UI**: Open **http://localhost:8501** in your browser
-- **API directly**: Open **http://localhost:8000/docs** for the Swagger UI
-- **Programmatic**: Send a POST request to `http://localhost:8000/predict`
-
-Example API call with PowerShell:
-```powershell
-$body = @{
-    numeric = @{
-        beds = 3
-        full_baths = 2
-        half_baths = 1
-        sqft = 1800
-        year_built = 1975
-        lot_sqft = 10000
-        stories = 2
-        hoa_fee = 0
-        parking_garage = 2
-    }
-    categorical = @{
-        style = "SINGLE_FAMILY"
-        city = "Anderson Township"
-        zip_code = "45230"
-        county = "Hamilton"
-    }
-    binary = @{
-        new_construction = $false
-    }
-} | ConvertTo-Json
-
-Invoke-RestMethod -Uri "http://localhost:8000/predict" -Method Post -Body $body -ContentType "application/json"
-```
-
----
-
-## Retraining After Changing Features
-
-The system is modular. If you change your feature engineering (add columns, remove columns, rename them), just:
-
-1. Update `scripts/feature_engineering.py` and regenerate `housing_engineered.csv`
-2. Run the training script (Step 2) — the schema builder auto-detects the new features
-3. Register and alias (Steps 3-4)
-4. Restart the API (Step 5)
-
-**No code changes needed in the API or Streamlit.** The schema drives everything dynamically.
-
----
-
-## Useful Commands Reference
+## Quick Reference: Full Pipeline in One Go
 
 ```powershell
-# ── Docker ──
-docker compose up --build -d      # Start all containers (background)
-docker compose down                # Stop all containers
-docker compose down -v             # Stop and wipe all data (fresh start)
-docker compose restart api         # Restart just the API
-docker compose logs -f             # Follow logs from all containers
-docker compose logs -f api         # Follow just the API logs
-docker compose ps                  # Check container status
+# Set tracking URI
+$env:MLFLOW_TRACKING_URI = "http://localhost:5000"
 
-# ── Training ──
-$env:MLFLOW_TRACKING_URI = "http://localhost:5000"    # Always set this first!
+# Run the full pipeline
+python scripts/scrape_and_clean.py --location "Cincinnati, OH" --past_days 365 --mlflow
+python scripts/Data_validation.py --mlflow
+python scripts/feature_engineering.py
+python scripts/train_and_tune.py --n_trials 50
 
-# Quick test (5 trials, ~5 min)
-python scripts/train_and_tune.py --data data/training/housing_engineered.csv --n_trials 5
-
-# Full tuning (50 trials, ~30-40 min)
-python scripts/train_and_tune.py --data data/training/housing_engineered.csv --n_trials 50
-
-# Extended tuning (100 trials, ~60-80 min)
-python scripts/train_and_tune.py --data data/training/housing_engineered.csv --n_trials 100
-
-# ── Debugging ──
-curl http://localhost:8000/health   # Check API status
-curl http://localhost:8000/schema   # View the loaded feature schema
+# Deploy the new champion
+docker compose restart api
 ```
 
 ---
 
-## URLs
+## Viewing Results
 
-| Service | URL | Purpose |
-|---------|-----|---------|
-| Streamlit UI | http://localhost:8501 | Make predictions |
-| FastAPI Docs | http://localhost:8000/docs | API documentation / testing |
-| API Health | http://localhost:8000/health | Check model status |
-| MLflow UI | http://localhost:5000 | View experiments, register models |
+- **Streamlit UI** — `http://localhost:8501` — Predict tab for predictions, Model Dashboard for champion info and version history
+- **MLflow UI** — `http://localhost:5000` — Full experiment tracking, run comparison, artifact inspection
+- **FastAPI docs** — `http://localhost:8000/docs` — Interactive API documentation and testing
+
+---
+
+## File Naming Convention
+
+Files carry their lineage through the pipeline via prefixed names:
+
+| Stage | Example Filename |
+|-------|-----------------|
+| Scrape & Clean | `Cincinnati_OH_365d_20260415_140000.csv` |
+| Validation Pass | `validated_Cincinnati_OH_365d_20260415_140000.csv` |
+| Validation Fail | `quarantined_Cincinnati_OH_365d_20260415_140000.csv` |
+| Fixed | `fixed_Cincinnati_OH_365d_20260415_140000.csv` |
+| Feature Engineering | `engineered_Cincinnati_OH_365d_20260415_140000.csv` |
+
+Each script auto-discovers the most recent file from the previous stage, so you rarely need to specify paths manually.
 
 ---
 
 ## Troubleshooting
 
-**"model_loaded: false"** → The champion alias isn't set or the API needs a restart. Register the model, set the alias, and run `docker compose restart api`.
+**API shows `model_loaded: false` after restart:**
+Check the API logs for the specific error: `docker logs housing-api --tail 20`. Common causes are a missing Python package (e.g., `xgboost`) or the champion alias not existing yet.
 
-**"schema_loaded: false"** → The model was trained with an older script that doesn't generate `feature_schema.json`. Retrain with the current `train_and_tune.py`.
+**Prediction returns a 500 error:**
+Usually a schema mismatch between the model's expected input types and what the API sends. Check `docker logs housing-api --tail 30` for the full traceback.
 
-**"Could not connect to API"** → The API container isn't running or still starting. Check `docker compose ps` and `docker compose logs api`.
+**MLflow UI not loading in the Streamlit dashboard iframe:**
+MLflow blocks iframe embedding by default. Use the "Open MLflow UI in a new tab" link, or access it directly at `http://localhost:5000`.
 
-**Training errors about MLflow endpoints** → Version mismatch. Make sure `docker/requirements-api.txt` and `docker/Dockerfile.mlflow` use the same MLflow version as your local environment (`pip show mlflow`).
-
-**Port conflicts** → Another process is using 5000, 8000, or 8501. Either stop it or change the port mapping in `docker-compose.yml` (e.g., `"5001:5000"`).
-
-**Need a completely fresh start** → `docker compose down -v` then `docker compose up --build -d`. This wipes all MLflow data, so you'll need to retrain and re-register.
+**Scripts not logging to MLflow:**
+Make sure `$env:MLFLOW_TRACKING_URI = "http://localhost:5000"` is set in your current terminal session. Without it, scripts fall back to a local SQLite file.
