@@ -486,21 +486,14 @@ with tab_mlflow:
             st.text(f"Schema loaded: {health.get('schema_loaded', False)}")
             st.text(f"Model: {health.get('model_name', '—')} @ {health.get('model_alias', '—')}")
 
-    # ── Embedded MLflow UI ───────────────────────────────────────────────
+    # ── MLflow Link ────────────────────────────────────────────────────────
     st.subheader("MLflow Tracking Server")
 
     st.markdown(
         f"🔗 **[Open MLflow UI in a new tab]({MLFLOW_IFRAME_URL})**"
     )
     st.caption(
-        "The embedded view below may not load if MLflow blocks iframe embedding. "
-        "Use the link above to open the full MLflow UI directly."
-    )
-
-    st.components.v1.iframe(
-        MLFLOW_IFRAME_URL,
-        height=800,
-        scrolling=True,
+        "Browse experiments, compare runs, and inspect artifacts in the full MLflow UI."
     )
 
 
