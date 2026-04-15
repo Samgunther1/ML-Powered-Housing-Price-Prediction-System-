@@ -55,6 +55,7 @@ class PredictionResponse(BaseModel):
     model_name: str
     model_alias: str
     input_summary: dict
+    warnings: list[str] = []
 
 
 class HealthResponse(BaseModel):
@@ -72,6 +73,8 @@ class SchemaResponse(BaseModel):
     binary_features: list[str]
     categorical_groups: dict[str, list[str]]
     auto_derived: dict[str, Any]
+    validity_bounds: dict[str, Any] = {}
+    validity_rules: dict[str, Any] = {}
 
 
 # ── Global State ─────────────────────────────────────────────────────────
@@ -283,6 +286,8 @@ def get_schema():
         binary_features=schema["binary_features"],
         categorical_groups=schema["categorical_groups"],
         auto_derived=schema.get("auto_derived", {}),
+        validity_bounds=schema.get("validity_bounds", {}),
+        validity_rules=schema.get("validity_rules", {}),
     )
 
 
@@ -294,7 +299,42 @@ def predict(req: PredictionRequest):
     if schema is None:
         raise HTTPException(503, "Feature schema not loaded.")
 
-    # Validate categorical inputs
+    warnings = []
+    bounds = schema.get("validity_bounds", {})
+    rules = schema.get("validity_rules", {})
+
+    # ── Validity domain: numeric range checks ──
+    for feat, value in req.numeric.items():
+        if feat in bounds:
+            b = bounds[feat]
+            if value < b["min"] or value > b["max"]:
+                raise HTTPException(
+                    422,
+                    f"'{feat.replace('_', ' ').title()}' value {value} is outside the "
+                    f"training data range [{b['min']}, {b['max']}]. "
+                    f"The model cannot reliably predict outside this range."
+                )
+            # Warn if in the extreme tails (outside 1st-99th percentile)
+            if value < b["p01"] or value > b["p99"]:
+                warnings.append(
+                    f"{feat.replace('_', ' ').title()} ({value}) is in the extreme "
+                    f"tail of the training data (1st–99th percentile: "
+                    f"{b['p01']}–{b['p99']}). Prediction may be less reliable."
+                )
+
+    # ── Validity domain: new_construction + year_built logic ──
+    if req.binary.get("new_construction", False):
+        min_year = rules.get("new_construction_min_year")
+        year_input = req.numeric.get("year_built")
+        if min_year and year_input and year_input < min_year:
+            raise HTTPException(
+                422,
+                f"New construction is checked but Year Built ({int(year_input)}) "
+                f"is before {min_year}. New construction properties in the training "
+                f"data were built in {min_year} or later."
+            )
+
+    # ── Validate categorical inputs ──
     for group_name, chosen in req.categorical.items():
         if chosen is None:
             continue
@@ -323,4 +363,5 @@ def predict(req: PredictionRequest):
         model_name=MODEL_NAME,
         model_alias=MODEL_ALIAS,
         input_summary=summary,
+        warnings=warnings,
     )

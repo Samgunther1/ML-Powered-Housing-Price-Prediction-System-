@@ -43,15 +43,20 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 
 
 # ── Feature Schema Builder ───────────────────────────────────────────────
-def build_feature_schema(feature_names: list[str]) -> dict:
-    """Auto-detect feature types from column naming conventions.
+def build_feature_schema(feature_names: list[str], X=None, y=None) -> dict:
+    """Auto-detect feature types from column naming conventions and compute
+    validity domain bounds from the training data.
 
-    Strategy: try progressively longer underscore-delimited prefixes to find
-    groups of 2+ columns that share the same prefix. For example:
-      - city_Cincinnati, city_Madeira  →  group "city" with values
-      - zip_code_45208, zip_code_45209 →  group "zip_code" with values
-      - sale_season_Spring, sale_season_Summer → group "sale_season" with values
-      - sale_month (standalone) → not grouped, classified separately
+    Parameters
+    ----------
+    feature_names : list[str]
+        Column names of the feature matrix.
+    X : array-like, optional
+        Training feature matrix. If provided, computes min/max bounds and
+        percentiles for each numeric feature to define the validity domain.
+    y : array-like, optional
+        Training target values. If provided, stores target range for
+        prediction sanity checks.
     """
     from collections import defaultdict
 
@@ -180,6 +185,42 @@ def build_feature_schema(feature_names: list[str]) -> dict:
         "numeric_defaults": numeric_defaults,
         "target": "sold_price",
     }
+
+    # ── Step 7: Compute validity domain from training data ──
+    if X is not None:
+        df_train = pd.DataFrame(X, columns=feature_names) if not isinstance(X, pd.DataFrame) else X
+
+        # Numeric bounds: min, max, 1st and 99th percentile
+        validity_bounds = {}
+        for col in numeric_features:
+            if col in df_train.columns:
+                series = pd.to_numeric(df_train[col], errors="coerce").dropna()
+                if len(series) > 0:
+                    validity_bounds[col] = {
+                        "min": round(float(series.min()), 2),
+                        "max": round(float(series.max()), 2),
+                        "p01": round(float(series.quantile(0.01)), 2),
+                        "p99": round(float(series.quantile(0.99)), 2),
+                        "median": round(float(series.median()), 2),
+                    }
+
+        schema["validity_bounds"] = validity_bounds
+
+        # Compute the max year_built in training data for new_construction logic
+        if "year_built" in df_train.columns:
+            max_year = int(df_train["year_built"].max())
+            schema["validity_rules"] = {
+                "new_construction_min_year": max_year - 2,
+            }
+
+    if y is not None:
+        y_series = pd.Series(y)
+        schema["target_range"] = {
+            "min": round(float(y_series.min()), 2),
+            "max": round(float(y_series.max()), 2),
+            "median": round(float(y_series.median()), 2),
+        }
+
     return schema
 
 # ── CLI ──────────────────────────────────────────────────────────────────
@@ -433,7 +474,7 @@ def train_final_model(X, y, best_params, feature_names, model_output, seed,
         feature_path.unlink()
 
         # ── Build & log feature schema for dynamic API/UI ──
-        schema = build_feature_schema(feature_names)
+        schema = build_feature_schema(feature_names, X=X, y=y)
         schema_path = Path("feature_schema.json")
         schema_path.write_text(json.dumps(schema, indent=2))
         mlflow.log_artifact(str(schema_path))
@@ -464,7 +505,7 @@ def train_final_model(X, y, best_params, feature_names, model_output, seed,
 
     # Also save feature schema alongside the model for local use
     meta_path = output_path.with_suffix(".meta.json")
-    schema = build_feature_schema(feature_names)
+    schema = build_feature_schema(feature_names, X=X, y=y)
     schema["n_features"] = len(feature_names)
     schema["training_rows"] = X.shape[0]
     schema["model_type"] = model_type

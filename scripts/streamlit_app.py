@@ -212,51 +212,74 @@ with tab_predict:
         st.subheader("Property Details")
 
         defaults = schema.get("numeric_defaults", {})
+        bounds = schema.get("validity_bounds", {})
+        rules = schema.get("validity_rules", {})
         numeric_inputs = {}
 
         cols = st.columns(3)
         for i, feat in enumerate(user_numeric):
             default_val = defaults.get(feat, 0)
+            b = bounds.get(feat, {})
+            # Use training data bounds for min/max when available
+            feat_min = b.get("min", None)
+            feat_max = b.get("max", None)
+
             with cols[i % 3]:
+                label = pretty_label(feat)
+                if feat_min is not None and feat_max is not None:
+                    label += f"  ({feat_min:g}–{feat_max:g})"
+
                 if feat in ("beds", "half_baths", "parking_garage"):
                     numeric_inputs[feat] = float(st.number_input(
-                        pretty_label(feat),
-                        min_value=0, value=int(default_val), step=1,
+                        label,
+                        min_value=int(feat_min) if feat_min is not None else 0,
+                        max_value=int(feat_max) if feat_max is not None else 99,
+                        value=int(default_val), step=1,
                         key=f"num_{feat}",
                     ))
                 elif feat in ("full_baths",):
                     numeric_inputs[feat] = float(st.number_input(
-                        pretty_label(feat),
-                        min_value=1, value=int(default_val), step=1,
+                        label,
+                        min_value=int(feat_min) if feat_min is not None else 1,
+                        max_value=int(feat_max) if feat_max is not None else 99,
+                        value=int(default_val), step=1,
                         key=f"num_{feat}",
                     ))
                 elif feat in ("year_built",):
                     numeric_inputs[feat] = float(st.number_input(
-                        pretty_label(feat),
-                        min_value=1800, max_value=2027, value=int(default_val), step=1,
+                        label,
+                        min_value=int(feat_min) if feat_min is not None else 1800,
+                        max_value=int(feat_max) if feat_max is not None else 2027,
+                        value=int(default_val), step=1,
                         key=f"num_{feat}",
                     ))
                 elif feat in ("sqft", "lot_sqft"):
                     numeric_inputs[feat] = float(st.number_input(
-                        pretty_label(feat),
-                        min_value=0, value=int(default_val), step=50,
+                        label,
+                        min_value=int(feat_min) if feat_min is not None else 0,
+                        max_value=int(feat_max) if feat_max is not None else 99999999,
+                        value=int(default_val), step=50,
                         key=f"num_{feat}",
                     ))
                 elif feat in ("hoa_fee",):
                     numeric_inputs[feat] = st.number_input(
-                        f"{pretty_label(feat)} ($/mo)",
-                        min_value=0.0, value=float(default_val), step=25.0,
+                        f"{pretty_label(feat)} ($/mo)  ({feat_min:g}–{feat_max:g})" if feat_min is not None else f"{pretty_label(feat)} ($/mo)",
+                        min_value=float(feat_min) if feat_min is not None else 0.0,
+                        max_value=float(feat_max) if feat_max is not None else 99999.0,
+                        value=float(default_val), step=25.0,
                         key=f"num_{feat}",
                     )
                 elif feat in ("stories",):
                     numeric_inputs[feat] = st.number_input(
-                        pretty_label(feat),
-                        min_value=0.0, max_value=5.0, value=float(default_val), step=0.5,
+                        label,
+                        min_value=float(feat_min) if feat_min is not None else 0.0,
+                        max_value=float(feat_max) if feat_max is not None else 5.0,
+                        value=float(default_val), step=0.5,
                         key=f"num_{feat}",
                     )
                 else:
                     numeric_inputs[feat] = st.number_input(
-                        pretty_label(feat),
+                        label,
                         value=float(default_val),
                         key=f"num_{feat}",
                     )
@@ -267,6 +290,17 @@ with tab_predict:
             for feat in schema["binary_features"]:
                 binary_inputs[feat] = st.checkbox(
                     pretty_label(feat), value=False, key=f"bin_{feat}"
+                )
+
+        # ── New construction + year_built validation ─────────────────────
+        new_construction_min_year = rules.get("new_construction_min_year")
+        if binary_inputs.get("new_construction", False) and new_construction_min_year:
+            year_input = numeric_inputs.get("year_built", 0)
+            if year_input < new_construction_min_year:
+                st.warning(
+                    f"⚠️ New Construction is checked but Year Built ({int(year_input)}) "
+                    f"is before {new_construction_min_year}. New construction properties "
+                    f"in the training data were built in {new_construction_min_year} or later."
                 )
 
         # ── Categorical Features ─────────────────────────────────────────
@@ -321,6 +355,11 @@ with tab_predict:
                     resp.raise_for_status()
                     result = resp.json()
 
+                    # Show warnings from validity domain checks
+                    if result.get("warnings"):
+                        for w in result["warnings"]:
+                            st.warning(f"⚠️ {w}")
+
                     st.success("Prediction complete!")
                     st.metric(
                         label="Estimated Sale Price",
@@ -346,7 +385,11 @@ with tab_predict:
                         detail = e.response.json().get("detail", str(e))
                     except Exception:
                         detail = str(e)
-                    st.error(f"Prediction failed: {detail}")
+                    # Show 422 validity domain errors as warnings, others as errors
+                    if e.response.status_code == 422:
+                        st.error(f"🚫 Outside training domain: {detail}")
+                    else:
+                        st.error(f"Prediction failed: {detail}")
                 except Exception as e:
                     st.error(f"An unexpected error occurred: {e}")
 
