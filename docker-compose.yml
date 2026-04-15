@@ -38,7 +38,7 @@ services:
       - mlflow-data:/mlflow
     environment:
       - MLFLOW_TRACKING_URI=http://mlflow:5000
-      - MODEL_NAME=housing_price_rf
+      - MODEL_NAME=housing_price_model
       - MODEL_ALIAS=champion
     depends_on:
       mlflow:
@@ -60,6 +60,8 @@ services:
       - "8501:8501"
     environment:
       - API_URL=http://api:8000
+      - MLFLOW_URL=http://mlflow:5000
+      - MLFLOW_IFRAME_URL=http://localhost:5000
     depends_on:
       api:
         condition: service_healthy

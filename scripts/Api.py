@@ -1,10 +1,11 @@
 """
 api.py – FastAPI backend for Housing Price Prediction
 ======================================================
-Loads the MLflow-registered model with alias 'champion' AND its
-feature_schema.json artifact. All feature encoding is driven by the
-schema — nothing is hardcoded. If you retrain with different features,
-just register the new model as champion and restart the API.
+Loads the MLflow-registered champion model (RF or XGBoost) AND its
+feature_schema.json artifact using mlflow.pyfunc so any model flavor
+works seamlessly. All feature encoding is driven by the schema —
+nothing is hardcoded. If you retrain with different features, just
+register the new model as champion and restart the API.
 
 Usage:
     uvicorn api:app --host 0.0.0.0 --port 8000 --reload
@@ -17,7 +18,7 @@ from datetime import datetime
 from typing import Any, Optional
 
 import mlflow
-import mlflow.sklearn
+import mlflow.pyfunc
 import numpy as np
 import pandas as pd
 from fastapi import FastAPI, HTTPException
@@ -26,7 +27,7 @@ from pydantic import BaseModel
 
 
 # ── Configuration ────────────────────────────────────────────────────────
-MODEL_NAME = os.getenv("MODEL_NAME", "housing_price_rf")
+MODEL_NAME = os.getenv("MODEL_NAME", "housing_price_model")
 MODEL_ALIAS = os.getenv("MODEL_ALIAS", "champion")
 MLFLOW_TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI", "http://mlflow:5000")
 
@@ -78,12 +79,39 @@ model = None
 schema = None
 
 
+def _find_champion_version(client: mlflow.MlflowClient):
+    """Find the champion model version using the search API (compatible with MLflow 3.x)."""
+    from mlflow.exceptions import MlflowException
+
+    # Try the direct alias lookup first (works in newer MLflow versions)
+    try:
+        return client.get_model_version_by_alias(MODEL_NAME, MODEL_ALIAS)
+    except (MlflowException, Exception):
+        pass
+
+    # Fallback: search registered models and find the alias manually
+    results = client.search_registered_models(filter_string=f"name='{MODEL_NAME}'")
+    if not results:
+        raise ValueError(f"Registered model '{MODEL_NAME}' not found")
+
+    reg_model = results[0]
+    for alias in getattr(reg_model, "aliases", {}).items() if hasattr(reg_model, "aliases") else []:
+        alias_name, alias_version = alias
+        if alias_name == MODEL_ALIAS:
+            return client.get_model_version(MODEL_NAME, alias_version)
+
+    # Last resort: parse aliases from the latest versions
+    for mv in reg_model.latest_versions:
+        if hasattr(mv, "aliases") and MODEL_ALIAS in (mv.aliases or []):
+            return mv
+
+    raise ValueError(f"No '{MODEL_ALIAS}' alias found for model '{MODEL_NAME}'")
+
+
 def load_schema_from_mlflow() -> dict:
     """Download feature_schema.json from the champion model's run artifacts."""
     client = mlflow.MlflowClient()
-
-    # Get the model version for the alias
-    mv = client.get_model_version_by_alias(MODEL_NAME, MODEL_ALIAS)
+    mv = _find_champion_version(client)
     run_id = mv.run_id
 
     # Download the schema artifact
@@ -102,8 +130,14 @@ async def lifespan(app: FastAPI):
     model_uri = f"models:/{MODEL_NAME}@{MODEL_ALIAS}"
     print(f"Loading model: {model_uri}")
     try:
-        model = mlflow.sklearn.load_model(model_uri)
-        print("Model loaded successfully")
+        model = mlflow.pyfunc.load_model(model_uri)
+        # Log which version and type we loaded
+        client = mlflow.MlflowClient()
+        mv = _find_champion_version(client)
+        tags = mv.tags if isinstance(mv.tags, dict) else {t.key: t.value for t in getattr(mv, 'tags', [])}
+        model_type = tags.get("model_type", "unknown")
+        cv_score = tags.get("cv_adj_r2", "N/A")
+        print(f"Model loaded: v{mv.version} ({model_type}, CV Adj R² = {cv_score})")
     except Exception as e:
         print(f"WARNING: Could not load model — {e}")
 
@@ -123,9 +157,9 @@ async def lifespan(app: FastAPI):
 # ── App ──────────────────────────────────────────────────────────────────
 app = FastAPI(
     title="Housing Price Predictor",
-    description="Predict Cincinnati-area housing prices using a tuned Random Forest model. "
-                "Feature schema is loaded dynamically from MLflow.",
-    version="2.0.0",
+    description="Predict Cincinnati-area housing prices using the MLflow champion model "
+                "(Random Forest or XGBoost). Feature schema is loaded dynamically from MLflow.",
+    version="2.1.0",
     lifespan=lifespan,
 )
 
@@ -201,6 +235,26 @@ def encode_features(req: PredictionRequest) -> pd.DataFrame:
                         row[onehot_col] = 1 if val == season else 0
 
     df = pd.DataFrame([row], columns=feature_columns)
+
+    # Cast columns to match the model's expected input schema exactly.
+    # The pyfunc model exposes its signature — use it to determine which
+    # columns need int64 vs float64.
+    try:
+        input_schema = model.metadata.get_input_schema()
+        if input_schema:
+            for col_spec in input_schema.inputs:
+                col_name = col_spec.name
+                if col_name in df.columns:
+                    if col_spec.type.name in ("long", "integer"):
+                        df[col_name] = df[col_name].astype(np.int64)
+                    elif col_spec.type.name in ("double", "float"):
+                        df[col_name] = df[col_name].astype(np.float64)
+    except Exception:
+        # Fallback: cast everything that looks like an integer column
+        for col in df.columns:
+            if df[col].dropna().apply(float.is_integer).all():
+                df[col] = df[col].astype(np.int64)
+
     return df
 
 
