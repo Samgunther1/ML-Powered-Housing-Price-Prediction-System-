@@ -182,10 +182,26 @@ def build_feature_schema(feature_names: list[str]) -> dict:
     return schema
 
 # ── CLI ──────────────────────────────────────────────────────────────────
+TRAINING_DIR = Path("data/training")
+
+
+def find_latest_training_file(directory: Path = TRAINING_DIR) -> Path:
+    """Find the most recently modified CSV in data/training/."""
+    csv_files = sorted(directory.glob("*.csv"), key=lambda f: f.stat().st_mtime)
+    if not csv_files:
+        raise FileNotFoundError(
+            f"No CSV files found in {directory}. "
+            f"Run feature_engineering.py first."
+        )
+    latest = csv_files[-1]
+    print(f"Auto-discovered training file: {latest}")
+    return latest
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Train & tune RF + XGBoost housing models")
-    parser.add_argument("--data", type=str, default="data/housing_engineered.csv",
-                        help="Path to the engineered CSV")
+    parser.add_argument("--data", type=str, default=None,
+                        help="Path to the engineered CSV (default: most recent in data/training/)")
     parser.add_argument("--n_trials", type=int, default=50,
                         help="Number of Optuna trials per model (default: 50)")
     parser.add_argument("--cv_folds", type=int, default=5,
@@ -200,7 +216,13 @@ def parse_args():
                         help="MLflow Model Registry name for champion model")
     parser.add_argument("--model_output", type=str, default="models/best_model.joblib",
                         help="Path to save the final model locally")
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    # Auto-discover if no --data provided
+    if args.data is None:
+        args.data = str(find_latest_training_file())
+
+    return args
 
 
 # ── Data Loading ─────────────────────────────────────────────────────────
