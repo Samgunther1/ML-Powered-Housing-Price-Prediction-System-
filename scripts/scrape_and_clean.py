@@ -25,6 +25,7 @@ import argparse
 import hashlib
 import json
 import logging
+import os
 from datetime import datetime
 from pathlib import Path
 
@@ -40,10 +41,10 @@ logger = logging.getLogger(__name__)
 OUTLIER_COLUMNS = [
     "sold_price",
     "sqft",
-   # "beds",
+    "beds",
     #"full_baths",
     #"half_baths",
-    #"lot_sqft",
+    "lot_sqft",
     #"stories",
     #"parking_garage",
     #"days_on_mls",
@@ -364,7 +365,7 @@ def log_cleaning_to_mlflow(
         mlflow.log_artifact(str(report_file), artifact_path="data_cleaning")
         mlflow.log_artifact(cleaned_file, artifact_path="data_cleaning")
 
-    mlflow.set_tracking_uri("sqlite:///mlflow.db")
+    mlflow.set_tracking_uri(os.getenv("MLFLOW_TRACKING_URI", "sqlite:///mlflow.db"))
     if run_id:
         with mlflow.start_run(run_id=run_id):
             _log()

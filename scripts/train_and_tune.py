@@ -15,6 +15,7 @@ Usage:
 
 import argparse
 import json
+import os
 import warnings
 from pathlib import Path
 
@@ -42,15 +43,20 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 
 
 # ── Feature Schema Builder ───────────────────────────────────────────────
-def build_feature_schema(feature_names: list[str]) -> dict:
-    """Auto-detect feature types from column naming conventions.
+def build_feature_schema(feature_names: list[str], X=None, y=None) -> dict:
+    """Auto-detect feature types from column naming conventions and compute
+    validity domain bounds from the training data.
 
-    Strategy: try progressively longer underscore-delimited prefixes to find
-    groups of 2+ columns that share the same prefix. For example:
-      - city_Cincinnati, city_Madeira  →  group "city" with values
-      - zip_code_45208, zip_code_45209 →  group "zip_code" with values
-      - sale_season_Spring, sale_season_Summer → group "sale_season" with values
-      - sale_month (standalone) → not grouped, classified separately
+    Parameters
+    ----------
+    feature_names : list[str]
+        Column names of the feature matrix.
+    X : array-like, optional
+        Training feature matrix. If provided, computes min/max bounds and
+        percentiles for each numeric feature to define the validity domain.
+    y : array-like, optional
+        Training target values. If provided, stores target range for
+        prediction sanity checks.
     """
     from collections import defaultdict
 
@@ -179,6 +185,42 @@ def build_feature_schema(feature_names: list[str]) -> dict:
         "numeric_defaults": numeric_defaults,
         "target": "sold_price",
     }
+
+    # ── Step 7: Compute validity domain from training data ──
+    if X is not None:
+        df_train = pd.DataFrame(X, columns=feature_names) if not isinstance(X, pd.DataFrame) else X
+
+        # Numeric bounds: min, max, 1st and 99th percentile
+        validity_bounds = {}
+        for col in numeric_features:
+            if col in df_train.columns:
+                series = pd.to_numeric(df_train[col], errors="coerce").dropna()
+                if len(series) > 0:
+                    validity_bounds[col] = {
+                        "min": round(float(series.min()), 2),
+                        "max": round(float(series.max()), 2),
+                        "p01": round(float(series.quantile(0.01)), 2),
+                        "p99": round(float(series.quantile(0.99)), 2),
+                        "median": round(float(series.median()), 2),
+                    }
+
+        schema["validity_bounds"] = validity_bounds
+
+        # Compute the max year_built in training data for new_construction logic
+        if "year_built" in df_train.columns:
+            max_year = int(df_train["year_built"].max())
+            schema["validity_rules"] = {
+                "new_construction_min_year": max_year - 2,
+            }
+
+    if y is not None:
+        y_series = pd.Series(y)
+        schema["target_range"] = {
+            "min": round(float(y_series.min()), 2),
+            "max": round(float(y_series.max()), 2),
+            "median": round(float(y_series.median()), 2),
+        }
+
     return schema
 
 # ── CLI ──────────────────────────────────────────────────────────────────
@@ -202,6 +244,9 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Train & tune RF + XGBoost housing models")
     parser.add_argument("--data", type=str, default=None,
                         help="Path to the engineered CSV (default: most recent in data/training/)")
+    parser.add_argument("--models", type=str, default="both",
+                        choices=["rf", "xgb", "both"],
+                        help="Which model(s) to train: 'rf', 'xgb', or 'both' (default: both)")
     parser.add_argument("--n_trials", type=int, default=50,
                         help="Number of Optuna trials per model (default: 50)")
     parser.add_argument("--cv_folds", type=int, default=5,
@@ -432,7 +477,7 @@ def train_final_model(X, y, best_params, feature_names, model_output, seed,
         feature_path.unlink()
 
         # ── Build & log feature schema for dynamic API/UI ──
-        schema = build_feature_schema(feature_names)
+        schema = build_feature_schema(feature_names, X=X, y=y)
         schema_path = Path("feature_schema.json")
         schema_path.write_text(json.dumps(schema, indent=2))
         mlflow.log_artifact(str(schema_path))
@@ -463,7 +508,7 @@ def train_final_model(X, y, best_params, feature_names, model_output, seed,
 
     # Also save feature schema alongside the model for local use
     meta_path = output_path.with_suffix(".meta.json")
-    schema = build_feature_schema(feature_names)
+    schema = build_feature_schema(feature_names, X=X, y=y)
     schema["n_features"] = len(feature_names)
     schema["training_rows"] = X.shape[0]
     schema["model_type"] = model_type
@@ -542,11 +587,22 @@ def main():
 
     X, y, feature_names = load_data(args.data)
 
+    # Determine which model types to train
+    if args.models == "both":
+        model_types = ["rf", "xgb"]
+    else:
+        model_types = [args.models]
+
+    model_labels = {"rf": "Random Forest", "xgb": "XGBoost"}
+    run_label = " + ".join(model_labels[m] for m in model_types)
+
     # ── MLflow setup ──
+    mlflow.set_tracking_uri(os.getenv("MLFLOW_TRACKING_URI", "sqlite:///mlflow.db"))
     mlflow.set_experiment(args.experiment_name)
 
-    with mlflow.start_run(run_name="dual_model_tuning_session") as parent_run:
+    with mlflow.start_run(run_name=f"tuning_{'+'.join(model_types)}") as parent_run:
         mlflow.set_tag("stage", "hyperparameter_tuning")
+        mlflow.set_tag("model_types", ",".join(model_types))
         mlflow.log_params({
             "n_trials_per_model": args.n_trials,
             "cv_folds":           args.cv_folds,
@@ -554,52 +610,51 @@ def main():
             "data_path":          args.data,
             "n_rows":             X.shape[0],
             "n_features":         X.shape[1],
+            "model_types":        ",".join(model_types),
         })
 
         n_features = X.shape[1]
 
-        # ── Run Optuna for both model types ──
-        rf_study  = run_optuna_study(X, y, "rf",  args.n_trials, args.cv_folds, args.seed, n_features)
-        xgb_study = run_optuna_study(X, y, "xgb", args.n_trials, args.cv_folds, args.seed, n_features)
+        # ── Run Optuna for selected model types ──
+        studies = {}
+        for mtype in model_types:
+            studies[mtype] = run_optuna_study(
+                X, y, mtype, args.n_trials, args.cv_folds, args.seed, n_features
+            )
 
-        rf_best  = rf_study.best_trial
-        xgb_best = xgb_study.best_trial
+        # ── Log best results to parent run ──
+        for mtype, study in studies.items():
+            best = study.best_trial
+            mlflow.log_metrics({
+                f"{mtype}_best_cv_adj_r2": round(best.value, 4),
+                f"{mtype}_best_trial_num": best.number,
+            })
 
-        # ── Log best results for both to parent run ──
-        mlflow.log_metrics({
-            "rf_best_cv_adj_r2":  round(rf_best.value, 4),
-            "rf_best_trial_num":  rf_best.number,
-            "xgb_best_cv_adj_r2": round(xgb_best.value, 4),
-            "xgb_best_trial_num": xgb_best.number,
-        })
-
-        # ── Determine champion ──
-        if xgb_best.value > rf_best.value:
-            champion_type  = "xgb"
-            champion_study = xgb_study
-            challenger_type = "rf"
+        # ── Determine this session's best model ──
+        if len(studies) == 1:
+            champion_type = model_types[0]
         else:
-            champion_type  = "rf"
-            champion_study = rf_study
-            challenger_type = "xgb"
+            champion_type = max(studies, key=lambda m: studies[m].best_value)
 
+        champion_study = studies[champion_type]
         champion_best = champion_study.best_trial
-        champion_label = "XGBoost" if champion_type == "xgb" else "Random Forest"
+        champion_label = model_labels[champion_type]
 
         print(f"\n{'=' * 65}")
-        print(f"  CHAMPION: {champion_label}  (CV Adj R² = {champion_best.value:.4f})")
-        print(f"  RF best:  {rf_best.value:.4f}  |  XGB best: {xgb_best.value:.4f}")
+        print(f"  SESSION BEST: {champion_label}  (CV Adj R² = {champion_best.value:.4f})")
+        for mtype, study in studies.items():
+            print(f"  {model_labels[mtype]} best: {study.best_value:.4f}")
         print(f"{'=' * 65}")
 
         mlflow.set_tag("champion_model_type", champion_type)
 
-        # ── Train final models for both (logged as nested runs) ──
+        # ── Train final models (logged as nested runs) ──
         results = {}
-        for mtype, study in [("rf", rf_study), ("xgb", xgb_study)]:
+        for mtype, study in studies.items():
             best = study.best_trial
             cv_metrics = retrieve_best_trial_cv_metrics(best.number, mtype)
 
-            suffix = "_rf" if mtype == "rf" else "_xgb"
+            suffix = f"_{mtype}"
             base = Path(args.model_output)
             output_path = str(base.parent / f"{base.stem}{suffix}.joblib")
 
