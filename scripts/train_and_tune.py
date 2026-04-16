@@ -244,6 +244,9 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Train & tune RF + XGBoost housing models")
     parser.add_argument("--data", type=str, default=None,
                         help="Path to the engineered CSV (default: most recent in data/training/)")
+    parser.add_argument("--models", type=str, default="both",
+                        choices=["rf", "xgb", "both"],
+                        help="Which model(s) to train: 'rf', 'xgb', or 'both' (default: both)")
     parser.add_argument("--n_trials", type=int, default=50,
                         help="Number of Optuna trials per model (default: 50)")
     parser.add_argument("--cv_folds", type=int, default=5,
@@ -584,12 +587,22 @@ def main():
 
     X, y, feature_names = load_data(args.data)
 
+    # Determine which model types to train
+    if args.models == "both":
+        model_types = ["rf", "xgb"]
+    else:
+        model_types = [args.models]
+
+    model_labels = {"rf": "Random Forest", "xgb": "XGBoost"}
+    run_label = " + ".join(model_labels[m] for m in model_types)
+
     # ── MLflow setup ──
     mlflow.set_tracking_uri(os.getenv("MLFLOW_TRACKING_URI", "sqlite:///mlflow.db"))
     mlflow.set_experiment(args.experiment_name)
 
-    with mlflow.start_run(run_name="dual_model_tuning_session") as parent_run:
+    with mlflow.start_run(run_name=f"tuning_{'+'.join(model_types)}") as parent_run:
         mlflow.set_tag("stage", "hyperparameter_tuning")
+        mlflow.set_tag("model_types", ",".join(model_types))
         mlflow.log_params({
             "n_trials_per_model": args.n_trials,
             "cv_folds":           args.cv_folds,
@@ -597,52 +610,51 @@ def main():
             "data_path":          args.data,
             "n_rows":             X.shape[0],
             "n_features":         X.shape[1],
+            "model_types":        ",".join(model_types),
         })
 
         n_features = X.shape[1]
 
-        # ── Run Optuna for both model types ──
-        rf_study  = run_optuna_study(X, y, "rf",  args.n_trials, args.cv_folds, args.seed, n_features)
-        xgb_study = run_optuna_study(X, y, "xgb", args.n_trials, args.cv_folds, args.seed, n_features)
+        # ── Run Optuna for selected model types ──
+        studies = {}
+        for mtype in model_types:
+            studies[mtype] = run_optuna_study(
+                X, y, mtype, args.n_trials, args.cv_folds, args.seed, n_features
+            )
 
-        rf_best  = rf_study.best_trial
-        xgb_best = xgb_study.best_trial
+        # ── Log best results to parent run ──
+        for mtype, study in studies.items():
+            best = study.best_trial
+            mlflow.log_metrics({
+                f"{mtype}_best_cv_adj_r2": round(best.value, 4),
+                f"{mtype}_best_trial_num": best.number,
+            })
 
-        # ── Log best results for both to parent run ──
-        mlflow.log_metrics({
-            "rf_best_cv_adj_r2":  round(rf_best.value, 4),
-            "rf_best_trial_num":  rf_best.number,
-            "xgb_best_cv_adj_r2": round(xgb_best.value, 4),
-            "xgb_best_trial_num": xgb_best.number,
-        })
-
-        # ── Determine champion ──
-        if xgb_best.value > rf_best.value:
-            champion_type  = "xgb"
-            champion_study = xgb_study
-            challenger_type = "rf"
+        # ── Determine this session's best model ──
+        if len(studies) == 1:
+            champion_type = model_types[0]
         else:
-            champion_type  = "rf"
-            champion_study = rf_study
-            challenger_type = "xgb"
+            champion_type = max(studies, key=lambda m: studies[m].best_value)
 
+        champion_study = studies[champion_type]
         champion_best = champion_study.best_trial
-        champion_label = "XGBoost" if champion_type == "xgb" else "Random Forest"
+        champion_label = model_labels[champion_type]
 
         print(f"\n{'=' * 65}")
-        print(f"  CHAMPION: {champion_label}  (CV Adj R² = {champion_best.value:.4f})")
-        print(f"  RF best:  {rf_best.value:.4f}  |  XGB best: {xgb_best.value:.4f}")
+        print(f"  SESSION BEST: {champion_label}  (CV Adj R² = {champion_best.value:.4f})")
+        for mtype, study in studies.items():
+            print(f"  {model_labels[mtype]} best: {study.best_value:.4f}")
         print(f"{'=' * 65}")
 
         mlflow.set_tag("champion_model_type", champion_type)
 
-        # ── Train final models for both (logged as nested runs) ──
+        # ── Train final models (logged as nested runs) ──
         results = {}
-        for mtype, study in [("rf", rf_study), ("xgb", xgb_study)]:
+        for mtype, study in studies.items():
             best = study.best_trial
             cv_metrics = retrieve_best_trial_cv_metrics(best.number, mtype)
 
-            suffix = "_rf" if mtype == "rf" else "_xgb"
+            suffix = f"_{mtype}"
             base = Path(args.model_output)
             output_path = str(base.parent / f"{base.stem}{suffix}.joblib")
 
