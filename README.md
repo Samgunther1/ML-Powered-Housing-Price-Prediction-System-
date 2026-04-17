@@ -1,5 +1,5 @@
 # ML-Powered Housing Price Prediction System
-### BANA 7075 — Final Project (Group 2)
+### BANA 7075 — Final Project
 
 ## 👥 Contributors
 * **Samuel Gunther**
