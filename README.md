@@ -20,12 +20,12 @@ This project addresses real estate price volatility by providing ML-powered, dat
 
 ## ✨ Value Proposition
 
-* **Financial Accuracy:** The ML system reducing pricing errors caused by market volatility by using data-driven predictions will help homebuyers avoid overpaying and enable sellers to list at competitive prices, leading to higher return on investments.
+* **Financial Accuracy** The ML system reducing pricing errors caused by market volatility by using data-driven predictions will help homebuyers avoid overpaying and enable sellers to list at competitive prices, leading to higher return on investments.
 * **Operational Efficiency:** By reducing reliance on manual appraisals and other assessments, financial institutions, local government agencies, homebuyers and sellers can cut down operational and administrative costs.
-* **Risk Mitigation:** Accurate property valuations allow banks and mortgage lenders to better assess collateral value before issuing loans. This lowers the risk of over-lending and foreclosures.
-* **Market Transparency:** The model will make pricing insights more accessible and understandable to all stakeholders, which will reduce miscommunications and allow buyers, sellers, and regulators to make more informed decisions.
-* **Policy Support:** Local governments can use data from the model to better understand housing affordability trends, which will allow them to make better informed decisions in setting up policies.
-* **Consumer Confidence:** Consistent, data-backed price estimates will help users feel more confident in their decisions, which will improve trust in the overall real estate process. It can also increase market participation in volatile markets. 
+* **Risk Mitigation** Accurate property valuations allow banks and mortgage lenders to better assess collateral value before issuing loans. This lowers the risk of over-lending and foreclosures.
+* **Market Transparency** The model will make pricing insights more accessible and understandable to all stakeholders, which will reduce miscommunications and allow buyers, sellers, and regulators to make more informed decisions.
+* **Policy Support** Local governments can use data from the model to better understand housing affordability trends, which will allow them to make better informed decisions in setting up policies.
+* **Consumer Confidence** Consistent, data-backed price estimates will help users feel more confident in their decisions, which will improve trust in the overall real estate process. It can also increase market participation in volatile markets. 
 
 ---
 
