@@ -1,7 +1,7 @@
 # ML-Powered Housing Price Prediction System
 ### BANA 7075 — Final Project
 
-## 👥 Contributors
+## 🤝 Contributors
 * **Samuel Gunther**
 * **Ryan O'Connor**
 * **Robin Cohen**
@@ -9,7 +9,7 @@
 
 ---
 
-## 🚀 Project Overview
+## 📖 Project Overview
 This project addresses real estate price volatility by providing ML-powered, data-driven valuations. By scraping real-time data via the `HomeHarvest` API, the system provides estimates to help stakeholders navigate volatile market conditions.
 
 ### 🎯 Target Stakeholders
@@ -18,7 +18,7 @@ This project addresses real estate price volatility by providing ML-powered, dat
 
 ---
 
-## ✨ Value Proposition
+## 💎 Value Proposition
 
 * **Financial Accuracy** The ML system reducing pricing errors caused by market volatility by using data-driven predictions will help homebuyers avoid overpaying and enable sellers to list at competitive prices, leading to higher return on investments.
 * **Operational Efficiency** By reducing reliance on manual appraisals and other assessments, financial institutions, local government agencies, homebuyers and sellers can cut down operational and administrative costs.
@@ -29,14 +29,14 @@ This project addresses real estate price volatility by providing ML-powered, dat
 
 ---
 
-## 🛠️ Model & Tech Stack
+## 💻 Model & Tech Stack
 * **Model** Random Forest Regressor
     * *Justification:* Chosen for its resistance to outliers in volatile markets and its ability to capture non-linear patterns (e.g., the impact of school districts on value)
 * **Data Source** `HomeHarvest` API
 * **Validation** `great_expectations`
 * **Versioning** `MLflow`
 
-### Key Design Principles
+###💡 Key Design Principles
 1.  **Adaptability & Flexibility** The pipeline can be retrained for any geographical location by simply updating the API query
 2.  **Automation** Model tuning and hyperparameter optimization are automated to adapt to new data without manual code changes
 3.  **Modularity & Abstraction** Each stage (Ingestion, Validation, Training) is self-contained, ensuring that updates to one do not break the others
