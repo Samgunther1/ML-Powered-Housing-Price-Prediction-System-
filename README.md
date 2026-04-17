@@ -47,8 +47,7 @@ The system follows a modular "DataOps" approach to ensure model integrity:
     * **Completeness:** Identifies missing values; triggers imputation or exclusion.
     * **Accuracy:** Range checks (e.g., Year Built $\geq$ 1900, Stories between 1–5).
     * **Schema:** Ensures Zip Codes are 5-digit strings and bedrooms are integers.
-3.  **Processing:** Valid
-
+3.  **Processing:** Validated data undergoes feature engineering.
 4.  **Training & Tracking:** Random Forest modeling with performance logging in MLflow.
 
 ---
