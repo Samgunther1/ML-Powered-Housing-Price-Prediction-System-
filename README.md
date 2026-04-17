@@ -36,7 +36,7 @@ This project addresses real estate price volatility by providing ML-powered, dat
 * **Validation** `great_expectations`
 * **Versioning** `MLflow`
 
-###💡 Key Design Principles
+##💡 Key Design Principles
 1.  **Adaptability & Flexibility** The pipeline can be retrained for any geographical location by simply updating the API query
 2.  **Automation** Model tuning and hyperparameter optimization are automated to adapt to new data without manual code changes
 3.  **Modularity & Abstraction** Each stage (Ingestion, Validation, Training) is self-contained, ensuring that updates to one do not break the others
