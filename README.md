@@ -63,8 +63,10 @@ The system follows a modular DataOps approach to ensure model integrity:
 | **Technical** | **RMSE** | Gives more weight to large errors, which is important for avoiding big pricing mistakes that can impact financial decisions |
 | **Technical** | **MAE** | Will help show how far off predictions are on average by measuring the average difference between predicted and actual housing prices. |
 | **Technical** | **Latency** | Ensures the user interface returns predictions quickly |
-| **Business** | **Sold Price Accuracy** | Tracks how often predicted prices match final sale prices |
-| **Business** | **Loan Default Rate** | Monitors if better valuations lead to safer lending decisions |
+| **Business** | **Average Time on Market** | Tracks how long properties take to sell, where better pricing should help reduce delays |
+| **Business** | **Sold Price Accuracy Rate** | Measures how often predicted prices are close to final sale prices, showing how useful the system is for buyers and sellers |
+| **Business** | **Loan Default Rate** | Tracks whether improved valuations help lenders reduce risky loans and defaults |
+| **Business** | **Revenue Impact** | Will measure increases in sales efficiency or transaction volume from better pricing decisions |
 
 ---
 
