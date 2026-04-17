@@ -47,7 +47,7 @@ This project addresses real estate price volatility by providing ML-powered, dat
 The system follows a modular "DataOps" approach to ensure model integrity:
 
 1.  **Ingestion** Raw data is scraped via `scrape_property` and logged in MLflow
-2.  **Validation (Great Expectations):**
+2.  **Validation (Great Expectations)**
     * **Completeness** Identifies missing values; triggers imputation or exclusion
     * **Accuracy** Ensures fields contain appropriate values based on context, eg: years built are not in the future
     * **Schema** Ensures each column contains values in the format assignd to the column, eg: ZIP codes are 5 digit strings
@@ -74,8 +74,8 @@ The system follows a modular "DataOps" approach to ensure model integrity:
 | :--- | :--- | :--- |
 | **1. Proposal** | Define problem, identify dataset, confirm approach | Project Proposal |
 | **2. Data & Setup** | Load data, clean dataset, explore features | Cleaned Dataset |
-| **3. Prototype** | Train initial model, build basic user interface | Working Prototype |
-| **4. Refinement** | Tune hyperparameters, improve UI/UX | Optimized System |
-| **5. Delivery** | Final testing, documentation, and demo | Final Report & Video |
+| **3. Prototype** | Train initial model, build basic user interface | Working Prototype & Demo |
+| **4. Refinement** | Tune hyperparameters, improve UI/UX | Improved System |
+| **5. Delivery** | Final testing, documentation, and demo | Final Report & Demo |
 
 ---
