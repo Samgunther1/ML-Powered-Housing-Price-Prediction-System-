@@ -44,7 +44,7 @@ This project addresses real estate price volatility by providing ML-powered, dat
 ---
 
 ## 🏗️ Data Pipeline Architecture
-The system follows a modular "DataOps" approach to ensure model integrity:
+The system follows a modular DataOps approach to ensure model integrity:
 
 1.  **Ingestion** Raw data is scraped via `scrape_property` and logged in MLflow
 2.  **Validation (Great Expectations)**
