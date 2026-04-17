@@ -19,8 +19,13 @@ This project addresses real estate price volatility by providing ML-powered, dat
 ---
 
 ## ✨ Value Proposition
-* Provides accessible pricing insights to facilitate transactions between buyers and sellers
-* Allows lenders to better assess value, lowering the risk of overlending
+
+* **Financial Accuracy:** The ML system reducing pricing errors caused by market volatility by using data-driven predictions will help homebuyers avoid overpaying and enable sellers to list at competitive prices, leading to higher return on investments.
+* **Operational Efficiency:** By reducing reliance on manual appraisals and other assessments, financial institutions, local government agencies, homebuyers and sellers can cut down operational and administrative costs.
+* **Risk Mitigation:** Accurate property valuations allow banks and mortgage lenders to better assess collateral value before issuing loans. This lowers the risk of over-lending and foreclosures.
+* **Market Transparency:** The model will make pricing insights more accessible and understandable to all stakeholders, which will reduce miscommunications and allow buyers, sellers, and regulators to make more informed decisions.
+* **Policy Support:** Local governments can use data from the model to better understand housing affordability trends, which will allow them to make better informed decisions in setting up policies.
+* **Consumer Confidence:** Consistent, data-backed price estimates will help users feel more confident in their decisions, which will improve trust in the overall real estate process. It can also increase market participation in volatile markets. 
 
 ---
 
@@ -67,10 +72,10 @@ The system follows a modular "DataOps" approach to ensure model integrity:
 
 | Phase | Tasks | Deliverable |
 | :--- | :--- | :--- |
-| **1. Proposal** | Define problem, identify dataset, confirm approach. | Project Proposal |
-| **2. Data & Setup** | Load data, clean dataset, explore features. | Cleaned Dataset |
-| **3. Prototype** | Train initial model, build basic user interface. | Working Prototype |
-| **4. Refinement** | Tune hyperparameters, improve UI/UX. | Optimized System |
-| **5. Delivery** | Final testing, documentation, and demo. | Final Report & Video |
+| **1. Proposal** | Define problem, identify dataset, confirm approach | Project Proposal |
+| **2. Data & Setup** | Load data, clean dataset, explore features | Cleaned Dataset |
+| **3. Prototype** | Train initial model, build basic user interface | Working Prototype |
+| **4. Refinement** | Tune hyperparameters, improve UI/UX | Optimized System |
+| **5. Delivery** | Final testing, documentation, and demo | Final Report & Video |
 
 ---
