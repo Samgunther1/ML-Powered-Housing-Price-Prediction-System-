@@ -70,6 +70,17 @@ The system follows a modular DataOps approach to ensure model integrity:
 
 ---
 
+## 🔍 Model Validation & Interpretability
+To ensure the model performs reliably, we plan to incorporate clear validation techniques alongside our existing metrics.
+
+- Evaluation metrics such as RMSE and MAE will be used to assess prediction accuracy
+- Cross-validation will help ensure the model generalizes well to unseen data
+- Feature importance will be visualized to show which variables most influence predictions
+
+These additions will improve transparency and make the model’s outputs easier to understand for stakeholders.
+
+---
+
 ## 📅 Development Roadmap
 
 | Phase | Tasks | Deliverable |
