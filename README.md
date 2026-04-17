@@ -19,8 +19,8 @@ This project addresses real estate price volatility by providing ML-powered, dat
 ---
 
 ## ✨ Value Proposition
-* Provides accessible pricing insights to facilitate transactions between buyers and sellers.
-* Allows lenders to better assess value, lowering the risk of overlending.
+* Provides accessible pricing insights to facilitate transactions between buyers and sellers
+* Allows lenders to better assess value, lowering the risk of overlending
 
 ---
 
@@ -44,7 +44,7 @@ The system follows a modular "DataOps" approach to ensure model integrity:
 1.  **Ingestion:** Raw data is scraped via `scrape_property` and logged in MLflow
 2.  **Validation (Great Expectations):**
     * **Completeness:** Identifies missing values; triggers imputation or exclusion
-    * ** Accuracy:** Ensures fields contain appropriate values based on context, eg: years built are not in the future
+    * **Accuracy:** Ensures fields contain appropriate values based on context, eg: years built are not in the future
     * **Schema:** Ensures each column contains values in the format assignd to the column, eg: ZIP codes are 5 digit strings
 3.  **Processing:** Validated data undergoes feature engineering
 4.  **Training & Tracking:** Random Forest modeling with performance logging in MLflow
