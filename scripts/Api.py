@@ -15,6 +15,7 @@ import json
 import os
 from contextlib import asynccontextmanager
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Optional
 
 import mlflow
@@ -23,6 +24,7 @@ import numpy as np
 import pandas as pd
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 
@@ -80,6 +82,7 @@ class SchemaResponse(BaseModel):
 # ── Global State ─────────────────────────────────────────────────────────
 model = None
 schema = None
+feature_importance_paths: dict[str, str] = {}
 
 
 def _find_champion_version(client: mlflow.MlflowClient):
@@ -152,6 +155,24 @@ async def lifespan(app: FastAPI):
               f"{len(schema['categorical_groups'])} categorical groups")
     except Exception as e:
         print(f"WARNING: Could not load feature schema — {e}")
+
+    # Load feature importance (SHAP) artifacts
+    # Downloaded once on startup; served via /feature-importance.
+    # If model_explanation.py hasn't been run yet, this fails silently
+    # and the endpoint returns 503 until the API is restarted.
+    try:
+        fi_client = mlflow.MlflowClient()
+        fi_mv = _find_champion_version(fi_client)
+        for fname in ("shap_bar_category.png", "shap_beeswarm_category.png"):
+            local_path = fi_client.download_artifacts(
+                fi_mv.run_id, f"explanations/{fname}"
+            )
+            feature_importance_paths[fname] = local_path
+        print(f"Feature importance artifacts loaded: "
+              f"{list(feature_importance_paths.keys())}")
+    except Exception as e:
+        print(f"WARNING: Could not load SHAP artifacts — {e}. "
+              f"Run scripts/model_explanation.py and restart the API.")
 
     yield
     print("Shutting down...")
@@ -365,3 +386,27 @@ def predict(req: PredictionRequest):
         input_summary=summary,
         warnings=warnings,
     )
+
+
+@app.get("/feature-importance")
+def feature_importance(plot: str = "bar"):
+    """Return the SHAP feature importance PNG for the champion model.
+
+    Query params:
+        plot: 'bar' (default) — mean |SHAP| per feature group
+              'beeswarm'       — per-row SHAP distribution
+    """
+    if plot not in ("bar", "beeswarm"):
+        raise HTTPException(400, "plot must be 'bar' or 'beeswarm'")
+    fname = (
+        "shap_bar_category.png" if plot == "bar"
+        else "shap_beeswarm_category.png"
+    )
+    path = feature_importance_paths.get(fname)
+    if not path or not Path(path).exists():
+        raise HTTPException(
+            503,
+            "Feature importance not available. Run "
+            "scripts/model_explanation.py and restart the API.",
+        )
+    return FileResponse(path, media_type="image/png", filename=fname)
