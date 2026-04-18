@@ -159,6 +159,25 @@ def load_champion_info():
         return None
 
 
+@st.cache_data(ttl=300)
+def load_feature_importance(plot: str = "bar"):
+    """Fetch the SHAP feature importance PNG from the API.
+
+    `plot` is 'bar' (category-level mean |SHAP|) or 'beeswarm'
+    (per-row distribution).
+    """
+    try:
+        resp = requests.get(
+            f"{API_URL}/feature-importance",
+            params={"plot": plot},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        return resp.content
+    except Exception:
+        return None
+
+
 def pretty_label(col_name: str) -> str:
     """Convert snake_case column names to readable labels."""
     return col_name.replace("_", " ").title()
@@ -469,6 +488,44 @@ with tab_mlflow:
                         st.metric(label, formatted)
                     shown += 1
 
+        # ── Feature Importance (SHAP) ────────────────────────────────────
+        st.subheader("Feature Importance (SHAP)")
+
+        fi_bar = load_feature_importance("bar")
+        if fi_bar is None:
+            st.info(
+                "Feature importance artifacts are not available yet. "
+                "Run `python scripts/model_explanation.py` and then "
+                "`docker compose restart api` to refresh."
+            )
+        else:
+            view_choice = st.radio(
+                "SHAP view",
+                options=["Bar", "Distribution"],
+                horizontal=True,
+                label_visibility="collapsed",
+                key="fi_view",
+            )
+            if view_choice == "Bar":
+                st.image(
+                    fi_bar,
+                    use_container_width=True,
+                    caption="Mean |SHAP value| per feature group — the average "
+                            "impact each group has on the predicted sale price.",
+                )
+            else:
+                fi_bee = load_feature_importance("beeswarm")
+                if fi_bee is None:
+                    st.warning("Beeswarm plot is not available.")
+                else:
+                    st.image(
+                        fi_bee,
+                        use_container_width=True,
+                        caption="Per-row SHAP distribution — points to the right "
+                                "pushed the prediction higher, points to the left "
+                                "pushed it lower.",
+                    )
+
         # ── Hyperparameters ──────────────────────────────────────────────
         if params:
             with st.expander("Hyperparameters"):
@@ -516,7 +573,7 @@ with tab_mlflow:
 
     else:
         st.warning(
-            f"Could not connect to MLflow at `{MLFLOW_EXTERNAL_URL}`. "
+            f"Could not connect to MLflow at `{MLFLOW_URL}`. "
             "Make sure the MLflow tracking server is running."
         )
 
