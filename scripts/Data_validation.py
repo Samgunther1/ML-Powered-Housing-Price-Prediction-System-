@@ -126,15 +126,15 @@ NOT_NULL_EXPECTATIONS = {
 
 # Range checks — outliers should already be removed, so these act as a safety net
 RANGE_EXPECTATIONS = {
-    "list_price": (100_000, 2_000_000, 1.0),
-    "sold_price": (100_000, 2_000_000, 1.0),
-    "sqft": (500, 10_000, 0.98),
-    "beds": (0, 15, 1.0),
-    "full_baths": (0, 15, 1.0),
-    "half_baths": (0, 10, 1.0),
+    "list_price": (100_000, 1_000_000, 1.0),
+    "sold_price": (100_000, 1_000_000, 1.0),
+    "sqft": (500, 5_000, 0.98),
+    "beds": (0, 8, 1.0),
+    "full_baths": (0, 5, 1.0),
+    "half_baths": (0, 5, 1.0),
     "year_built": (1900, 2027, 0.95),
-    "lot_sqft": (0, 5_000_000, 0.85),
-    "stories": (0, 7, 0.95),
+    "lot_sqft": (0, 200_000, 0.85),
+    "stories": (0, 5, 0.95),
 }
 
 CATEGORICAL_EXPECTATIONS = {
@@ -144,10 +144,9 @@ CATEGORICAL_EXPECTATIONS = {
          "CONDO",
          "CONDOS",
          "TOWNHOMES",
-         "MULTI_FAMILY",
          "APARTMENT",
         ],
-        0.98,
+        1.0,
     ),
     "status": (
         ["SOLD"],

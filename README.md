@@ -30,8 +30,8 @@ This project addresses real estate price volatility by providing ML-powered, dat
 ---
 
 ## 💻 Model & Tech Stack
-* **Model** Random Forest Regressor
-    * *Justification:* Chosen for its resistance to outliers in volatile markets and its ability to capture non-linear patterns (e.g., the impact of school districts on value)
+* **Model** XGBoost Regressor
+    * *Justification:* Chosen for its resistance to outliers in volatile markets and its ability to capture non-linear patterns
 * **Data Source** `HomeHarvest` API
 * **Validation** `great_expectations`
 * **Versioning** `MLflow`
@@ -52,7 +52,7 @@ The system follows a modular DataOps approach to ensure model integrity:
     * **Accuracy** Ensures fields contain appropriate values based on context, eg: years built are not in the future
     * **Schema** Ensures each column contains values in the format assignd to the column, eg: ZIP codes are 5 digit strings
 3.  **Processing** Validated data undergoes feature engineering
-4.  **Training & Tracking** Random Forest modeling with performance logging in MLflow
+4.  **Training & Tracking** XGBoost modeling with performance logging in MLflow
 
 ---
 
@@ -60,13 +60,10 @@ The system follows a modular DataOps approach to ensure model integrity:
 
 | Category | Metric | Significance |
 | :--- | :--- | :--- |
+| **Technical** | **Adjusted R²** | Primary optimization target, penalizes R² for the number of features used |
 | **Technical** | **RMSE** | Gives more weight to large errors, which is important for avoiding big pricing mistakes that can impact financial decisions |
-| **Technical** | **MAE** | Will help show how far off predictions are on average by measuring the average difference between predicted and actual housing prices. |
-| **Technical** | **Latency** | Ensures the user interface returns predictions quickly |
-| **Business** | **Average Time on Market** | Tracks how long properties take to sell, where better pricing should help reduce delays |
-| **Business** | **Sold Price Accuracy Rate** | Measures how often predicted prices are close to final sale prices, showing how useful the system is for buyers and sellers |
-| **Business** | **Loan Default Rate** | Tracks whether improved valuations help lenders reduce risky loans and defaults |
-| **Business** | **Revenue Impact** | Will measure increases in sales efficiency or transaction volume from better pricing decisions |
+| **Technical** | **MAE** | Will help show how far off predictions are on average by measuring the average difference between predicted and actual housing prices |
+| **Business** | **Share of predictions within ±20% of the actual sale price** | A valuation tool that's within 20% on most homes is the goal |
 
 ---
 

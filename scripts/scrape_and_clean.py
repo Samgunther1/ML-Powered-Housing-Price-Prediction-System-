@@ -55,7 +55,6 @@ VALID_STYLES = [
     "CONDO",
     "CONDOS",
     "TOWNHOMES",
-    "MULTI_FAMILY",
     "APARTMENT",
 ]
 
